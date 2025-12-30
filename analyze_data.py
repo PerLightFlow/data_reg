@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import itertools
 
 import numpy as np
 import pandas as pd
@@ -30,9 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--plot-weight",
-        type=float,
-        default=100.0,
-        help="plot-all-devices 时选择的重量（默认100g）",
+        type=str,
+        default="100",
+        help="plot-all-devices 时选择的重量：如 '100' / '50,100,200' / 'all'（默认100g）",
     )
     p.add_argument(
         "--out-dir",
@@ -48,6 +51,20 @@ def build_parser() -> argparse.ArgumentParser:
             "误差计算方式：raw=信号-真实重量；"
             "norm20=按20°C(S0,S100)归一后的读数-真实重量；"
             "compensated=归一+温度补偿后的读数-真实重量"
+        ),
+    )
+    p.add_argument(
+        "--compare-raw-compensated",
+        action="store_true",
+        help="兼容参数：等价于 --compare-modes raw,compensated（建议使用 --compare-modes）",
+    )
+    p.add_argument(
+        "--compare-modes",
+        type=str,
+        default=None,
+        help=(
+            "在同一张图中同时绘制两种误差模式（第二条曲线用虚线），会忽略 --error-mode；"
+            "示例：'norm20,compensated' / 'raw,compensated' / 'raw,norm20'"
         ),
     )
     p.add_argument(
@@ -81,6 +98,66 @@ def _fit_line(x: np.ndarray, y: np.ndarray):
     A = np.column_stack([x, np.ones(len(x), dtype=float)])
     a, b = np.linalg.lstsq(A, y, rcond=None)[0]
     return float(a), float(b)
+
+
+def _parse_plot_weight_expr(expr: str, available_weights: list[float]) -> list[float]:
+    """
+    支持：
+    - "all": 使用数据中所有重量
+    - "50,100,200": 指定多个重量
+    - "50-400": 在可用重量中选取落在区间内的重量
+    - 单个数值字符串，如 "100"
+    """
+
+    available = sorted(float(x) for x in set(available_weights))
+    raw = (expr or "").strip().lower()
+    if raw in ("", "default"):
+        raw = "100"
+    if raw in ("all", "*"):
+        return available
+
+    weights: list[float] = []
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part and part.count("-") == 1 and not part.startswith("-"):
+            a_str, b_str = part.split("-", 1)
+            start = float(a_str)
+            end = float(b_str)
+            if start > end:
+                start, end = end, start
+            sel = [w for w in available if start - 1e-9 <= w <= end + 1e-9]
+            if not sel:
+                raise ValueError(f"--plot-weight 区间 {part!r} 在数据中未匹配到任何重量，可用: {available}")
+            weights.extend(sel)
+        else:
+            weights.append(float(part))
+
+    # 将输入的重量映射到“数据里存在的重量”（用 isclose 容忍 100 vs 100.0）
+    resolved: list[float] = []
+    for w in weights:
+        matches = [aw for aw in available if np.isclose(aw, w)]
+        if not matches:
+            raise ValueError(f"--plot-weight 包含数据里不存在的重量: {w:g}；可用: {available}")
+        resolved.append(float(matches[0]))
+
+    # 去重并保持排序
+    return sorted(set(resolved))
+
+
+def _parse_compare_modes(expr: str) -> tuple[str, str]:
+    raw = (expr or "").strip().lower().replace(" ", "")
+    parts = [p for p in raw.split(",") if p]
+    if len(parts) != 2:
+        raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,compensated'：当前={expr!r}")
+
+    valid = {"raw", "norm20", "compensated"}
+    a, b = parts[0], parts[1]
+    if a not in valid or b not in valid:
+        raise ValueError(f"--compare-modes 只支持 {sorted(valid)}：当前={expr!r}")
+    if a == b:
+        raise ValueError(f"--compare-modes 需要两个不同模式：当前={expr!r}")
+    return a, b
 
 
 def _infer_calibration_at_ref_temp(df: pd.DataFrame, *, ref_temp: float) -> pd.DataFrame:
@@ -124,13 +201,14 @@ def _prepare_error_dataframe(
     ref_temp: float,
     model_path: str,
     relative_to_ref: bool,
+    calibration_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     df = df.copy()
 
     if error_mode == "raw":
         df["measured"] = df["信号"].astype(float)
     else:
-        cal = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
+        cal = calibration_df if calibration_df is not None else _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
         df = df.merge(cal, on="样机编号", how="left")
 
         s = df["信号"].to_numpy(float)
@@ -204,6 +282,24 @@ def _set_matplotlib_chinese_font(plt):
     plt.rcParams["axes.unicode_minus"] = False
 
 
+def _extract_sorted_xy(df: pd.DataFrame, *, x_col: str, y_col: str) -> tuple[np.ndarray, np.ndarray]:
+    x = df[x_col].to_numpy(float)
+    y = df[y_col].to_numpy(float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    # 若存在重复温度点，做简单平均
+    xu, inv = np.unique(x, return_inverse=True)
+    if len(xu) != len(x):
+        yu = np.zeros(len(xu), dtype=float)
+        for i in range(len(xu)):
+            yu[i] = float(np.mean(y[inv == i]))
+        x, y = xu, yu
+    return x, y
+
+
 def _plot_temp_drift(
     df: pd.DataFrame,
     *,
@@ -213,6 +309,7 @@ def _plot_temp_drift(
     model_path: str,
     relative_to_ref: bool,
     interp: bool,
+    compare_modes: tuple[str, str] | None,
 ) -> None:
     from pathlib import Path
 
@@ -226,53 +323,118 @@ def _plot_temp_drift(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    df_err = _prepare_error_dataframe(
-        df,
-        error_mode=error_mode,
-        ref_temp=ref_temp,
-        model_path=model_path,
-        relative_to_ref=relative_to_ref,
-    )
+    calibration_df: pd.DataFrame | None = None
+    if compare_modes is not None or error_mode in ("norm20", "compensated"):
+        calibration_df = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
+
+    if compare_modes is not None:
+        mode_a, mode_b = compare_modes
+        df_a = _prepare_error_dataframe(
+            df,
+            error_mode=mode_a,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
+        df_b = _prepare_error_dataframe(
+            df,
+            error_mode=mode_b,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
+    else:
+        df_err = _prepare_error_dataframe(
+            df,
+            error_mode=error_mode,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
 
     ylabel = "误差（测得-真实, g）"
     if relative_to_ref:
         ylabel = f"温漂（相对{ref_temp:g}°C归零, g）"
 
-    mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
+    if compare_modes is not None:
+        mode_a, mode_b = compare_modes
+        mode_desc = f"{mode_a}_vs_{mode_b}"
+    else:
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
 
-    for device_id, gdev in df_err.groupby("样机编号"):
+    for device_id in sorted(df["样机编号"].unique().tolist()):
+        if compare_modes is not None:
+            gdev_a = df_a[df_a["样机编号"] == device_id]
+            gdev_b = df_b[df_b["样机编号"] == device_id]
+            if gdev_a.empty and gdev_b.empty:
+                continue
+            weights = sorted(set(gdev_a["重量"].unique().tolist()) | set(gdev_b["重量"].unique().tolist()))
+        else:
+            gdev = df_err[df_err["样机编号"] == device_id]
+            if gdev.empty:
+                continue
+            weights = sorted(gdev["重量"].unique().tolist())
+
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
         ax.grid(True, alpha=0.3)
 
-        for w in sorted(gdev["重量"].unique().tolist()):
-            gw = gdev[gdev["重量"] == w].copy()
-            x = gw["芯片温度"].to_numpy(float)
-            y = gw["error_plot"].to_numpy(float)
+        colors = plt.rcParams.get("axes.prop_cycle", None)
+        color_list = colors.by_key().get("color") if colors is not None else None
+        color_cycle = itertools.cycle(color_list or ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"])
 
-            # 按芯片温度排序；若存在重复温度点，做简单平均
-            order = np.argsort(x)
-            x = x[order]
-            y = y[order]
-            xu, inv = np.unique(x, return_inverse=True)
-            if len(xu) != len(x):
-                yu = np.zeros(len(xu), dtype=float)
-                for i in range(len(xu)):
-                    yu[i] = float(np.mean(y[inv == i]))
-                x, y = xu, yu
+        for w in weights:
+            color = next(color_cycle)
 
-            ax.scatter(x, y, s=45, label=f"{int(w)}g")
-            ax.plot(x, y, linewidth=1.5, alpha=0.8)
+            if compare_modes is not None:
+                gw_a = gdev_a[gdev_a["重量"] == w].copy()
+                if not gw_a.empty:
+                    x_a, y_a = _extract_sorted_xy(gw_a, x_col="芯片温度", y_col="error_plot")
+                    ax.scatter(x_a, y_a, s=45, marker="o", color=color, alpha=0.85, label=f"{int(w)}g")
+                    ax.plot(x_a, y_a, linewidth=1.8, alpha=0.9, color=color, linestyle="-")
+                    if interp and len(x_a) >= 2:
+                        xi = np.linspace(float(np.min(x_a)), float(np.max(x_a)), 150)
+                        yi = np.interp(xi, x_a, y_a)
+                        ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color, linestyle="-")
 
-            if interp and len(x) >= 2:
-                xi = np.linspace(float(np.min(x)), float(np.max(x)), 150)
-                yi = np.interp(xi, x, y)
-                ax.plot(xi, yi, linewidth=2.0, alpha=0.6)
+                gw_b = gdev_b[gdev_b["重量"] == w].copy()
+                if not gw_b.empty:
+                    x_b, y_b = _extract_sorted_xy(gw_b, x_col="芯片温度", y_col="error_plot")
+                    ax.scatter(x_b, y_b, s=45, marker="x", color=color, alpha=0.85)
+                    ax.plot(x_b, y_b, linewidth=1.8, alpha=0.9, color=color, linestyle="--")
+                    if interp and len(x_b) >= 2:
+                        xi = np.linspace(float(np.min(x_b)), float(np.max(x_b)), 150)
+                        yi = np.interp(xi, x_b, y_b)
+                        ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color, linestyle="--")
+            else:
+                gw = gdev[gdev["重量"] == w].copy()
+                x, y = _extract_sorted_xy(gw, x_col="芯片温度", y_col="error_plot")
+                ax.scatter(x, y, s=45, label=f"{int(w)}g")
+                ax.plot(x, y, linewidth=1.5, alpha=0.8)
+                if interp and len(x) >= 2:
+                    xi = np.linspace(float(np.min(x)), float(np.max(x)), 150)
+                    yi = np.interp(xi, x, y)
+                    ax.plot(xi, yi, linewidth=2.0, alpha=0.6)
 
         ax.set_xlabel("芯片温度读数")
         ax.set_ylabel(ylabel)
         ax.set_title(f"样机{int(device_id)} 温漂曲线（mode={mode_desc}）")
-        ax.legend(title="重量")
+
+        if compare_modes is not None:
+            from matplotlib.lines import Line2D
+
+            leg1 = ax.legend(title="重量", loc="upper left")
+            ax.add_artist(leg1)
+            style_handles = [
+                Line2D([0], [0], color="black", linestyle="-", marker="o", label=mode_a),
+                Line2D([0], [0], color="black", linestyle="--", marker="x", label=mode_b),
+            ]
+            ax.legend(handles=style_handles, title="模式", loc="upper right")
+        else:
+            ax.legend(title="重量")
 
         fname = f"device_{int(device_id)}_drift_{mode_desc}.png"
         fig.tight_layout()
@@ -290,6 +452,7 @@ def _plot_all_devices_drift(
     relative_to_ref: bool,
     interp: bool,
     plot_weight: float,
+    compare_modes: tuple[str, str] | None,
 ) -> None:
     """
     将所有设备叠加到同一张图：
@@ -310,62 +473,132 @@ def _plot_all_devices_drift(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    df_err = _prepare_error_dataframe(
-        df,
-        error_mode=error_mode,
-        ref_temp=ref_temp,
-        model_path=model_path,
-        relative_to_ref=relative_to_ref,
-    )
+    calibration_df = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
 
-    if "T20" not in df_err.columns:
-        cal = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
-        df_err = df_err.merge(cal[["样机编号", "T20"]], on="样机编号", how="left")
+    if compare_modes is not None:
+        mode_a, mode_b = compare_modes
+        df_a = _prepare_error_dataframe(
+            df,
+            error_mode=mode_a,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
+        if "T20" not in df_a.columns:
+            df_a = df_a.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
+        df_a["dT"] = df_a["芯片温度"].to_numpy(float) - df_a["T20"].to_numpy(float)
 
-    df_err = df_err.copy()
-    df_err["dT"] = df_err["芯片温度"].to_numpy(float) - df_err["T20"].to_numpy(float)
+        df_b = _prepare_error_dataframe(
+            df,
+            error_mode=mode_b,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
+        if "T20" not in df_b.columns:
+            df_b = df_b.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
+        df_b["dT"] = df_b["芯片温度"].to_numpy(float) - df_b["T20"].to_numpy(float)
 
-    df_w = df_err[np.isclose(df_err["重量"].to_numpy(float), float(plot_weight))]
-    if df_w.empty:
-        available = sorted(df_err["重量"].unique().tolist())
-        raise ValueError(f"未找到重量={plot_weight:g}g 的数据，可选重量: {available}")
+        df_w_a = df_a[np.isclose(df_a["重量"].to_numpy(float), float(plot_weight))]
+        df_w_b = df_b[np.isclose(df_b["重量"].to_numpy(float), float(plot_weight))]
+        if df_w_a.empty and df_w_b.empty:
+            available = sorted(df["重量"].unique().tolist())
+            raise ValueError(f"未找到重量={plot_weight:g}g 的数据，可选重量: {available}")
+    else:
+        df_err = _prepare_error_dataframe(
+            df,
+            error_mode=error_mode,
+            ref_temp=ref_temp,
+            model_path=model_path,
+            relative_to_ref=relative_to_ref,
+            calibration_df=calibration_df,
+        )
+        if "T20" not in df_err.columns:
+            df_err = df_err.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
+        df_err = df_err.copy()
+        df_err["dT"] = df_err["芯片温度"].to_numpy(float) - df_err["T20"].to_numpy(float)
+        df_w = df_err[np.isclose(df_err["重量"].to_numpy(float), float(plot_weight))]
+        if df_w.empty:
+            available = sorted(df_err["重量"].unique().tolist())
+            raise ValueError(f"未找到重量={plot_weight:g}g 的数据，可选重量: {available}")
 
     ylabel = "误差（测得-真实, g）"
     if relative_to_ref:
         ylabel = f"温漂（相对{ref_temp:g}°C归零, g）"
 
-    mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
+    if compare_modes is not None:
+        mode_a, mode_b = compare_modes
+        mode_desc = f"{mode_a}_vs_{mode_b}"
+    else:
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
     ax.grid(True, alpha=0.3)
 
-    for device_id, gdev in df_w.groupby("样机编号"):
-        x = gdev["dT"].to_numpy(float)
-        y = gdev["error_plot"].to_numpy(float)
+    device_ids = sorted(df["样机编号"].unique().tolist())
+    colors = plt.rcParams.get("axes.prop_cycle", None)
+    color_list = colors.by_key().get("color") if colors is not None else None
+    color_cycle = itertools.cycle(color_list or ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"])
+    device_to_color = {int(did): next(color_cycle) for did in device_ids}
 
-        order = np.argsort(x)
-        x = x[order]
-        y = y[order]
-        xu, inv = np.unique(x, return_inverse=True)
-        if len(xu) != len(x):
-            yu = np.zeros(len(xu), dtype=float)
-            for i in range(len(xu)):
-                yu[i] = float(np.mean(y[inv == i]))
-            x, y = xu, yu
+    for device_id in device_ids:
+        color = device_to_color[int(device_id)]
+        if compare_modes is not None:
+            ga = df_w_a[df_w_a["样机编号"] == device_id]
+            gb = df_w_b[df_w_b["样机编号"] == device_id]
+            if ga.empty and gb.empty:
+                continue
 
-        ax.scatter(x, y, s=45, alpha=0.85)
-        ax.plot(x, y, linewidth=1.8, alpha=0.9, label=f"样机{int(device_id)}")
+            if not ga.empty:
+                x_a, y_a = _extract_sorted_xy(ga, x_col="dT", y_col="error_plot")
+                ax.scatter(x_a, y_a, s=45, marker="o", color=color, alpha=0.85)
+                ax.plot(x_a, y_a, linewidth=1.9, alpha=0.9, color=color, linestyle="-", label=f"样机{int(device_id)}")
+                if interp and len(x_a) >= 2:
+                    xi = np.linspace(float(np.min(x_a)), float(np.max(x_a)), 150)
+                    yi = np.interp(xi, x_a, y_a)
+                    ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color, linestyle="-")
 
-        if interp and len(x) >= 2:
-            xi = np.linspace(float(np.min(x)), float(np.max(x)), 150)
-            yi = np.interp(xi, x, y)
-            ax.plot(xi, yi, linewidth=2.2, alpha=0.5)
+            if not gb.empty:
+                x_b, y_b = _extract_sorted_xy(gb, x_col="dT", y_col="error_plot")
+                ax.scatter(x_b, y_b, s=45, marker="x", color=color, alpha=0.85)
+                ax.plot(x_b, y_b, linewidth=1.9, alpha=0.9, color=color, linestyle="--")
+                if interp and len(x_b) >= 2:
+                    xi = np.linspace(float(np.min(x_b)), float(np.max(x_b)), 150)
+                    yi = np.interp(xi, x_b, y_b)
+                    ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color, linestyle="--")
+        else:
+            gdev = df_w[df_w["样机编号"] == device_id]
+            if gdev.empty:
+                continue
+            x, y = _extract_sorted_xy(gdev, x_col="dT", y_col="error_plot")
+
+            ax.scatter(x, y, s=45, alpha=0.85, color=color)
+            ax.plot(x, y, linewidth=1.8, alpha=0.9, color=color, label=f"样机{int(device_id)}")
+
+            if interp and len(x) >= 2:
+                xi = np.linspace(float(np.min(x)), float(np.max(x)), 150)
+                yi = np.interp(xi, x, y)
+                ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color)
 
     ax.set_xlabel(f"芯片温度差值 ΔT = Tchip - T20(ref={ref_temp:g}°C)")
     ax.set_ylabel(ylabel)
     ax.set_title(f"所有样机温漂曲线（重量={plot_weight:g}g, mode={mode_desc}）")
-    ax.legend(title="设备", ncol=2, fontsize=10)
+
+    if compare_modes is not None:
+        from matplotlib.lines import Line2D
+
+        leg1 = ax.legend(title="设备", ncol=2, fontsize=10, loc="upper left")
+        ax.add_artist(leg1)
+        style_handles = [
+            Line2D([0], [0], color="black", linestyle="-", marker="o", label=mode_a),
+            Line2D([0], [0], color="black", linestyle="--", marker="x", label=mode_b),
+        ]
+        ax.legend(handles=style_handles, title="模式", loc="upper right")
+    else:
+        ax.legend(title="设备", ncol=2, fontsize=10)
 
     weight_tag = f"{plot_weight:g}".replace("-", "m").replace(".", "p")
     fname = f"all_devices_drift_{mode_desc}_w{weight_tag}.png"
@@ -379,6 +612,15 @@ def main() -> None:
     from data_loader import read_measurement_table
 
     df = read_measurement_table(args.csv, sheet=args.sheet)
+
+    compare_modes: tuple[str, str] | None = None
+    if args.compare_modes:
+        try:
+            compare_modes = _parse_compare_modes(str(args.compare_modes))
+        except ValueError as e:
+            raise SystemExit(str(e))
+    elif args.compare_raw_compensated:
+        compare_modes = ("raw", "compensated")
 
     print("shape:", df.shape)
     print("columns:", list(df.columns))
@@ -444,21 +686,26 @@ def main() -> None:
             model_path=args.model,
             relative_to_ref=bool(args.relative_to_ref),
             interp=bool(args.interp),
+            compare_modes=compare_modes,
         )
         print(f"\nDrift plots saved to: {args.out_dir}")
         plotted_any = True
 
     if args.plot_all_devices:
-        _plot_all_devices_drift(
-            df,
-            out_dir=args.out_dir,
-            error_mode=args.error_mode,
-            ref_temp=float(args.ref_temp),
-            model_path=args.model,
-            relative_to_ref=bool(args.relative_to_ref),
-            interp=bool(args.interp),
-            plot_weight=float(args.plot_weight),
-        )
+        available_weights = sorted(df["重量"].unique().tolist())
+        weights_to_plot = _parse_plot_weight_expr(str(args.plot_weight), available_weights)
+        for w in weights_to_plot:
+            _plot_all_devices_drift(
+                df,
+                out_dir=args.out_dir,
+                error_mode=args.error_mode,
+                ref_temp=float(args.ref_temp),
+                model_path=args.model,
+                relative_to_ref=bool(args.relative_to_ref),
+                interp=bool(args.interp),
+                plot_weight=float(w),
+                compare_modes=compare_modes,
+            )
         print(f"\nAll-devices drift plot saved to: {args.out_dir}")
         plotted_any = True
 
@@ -471,7 +718,9 @@ def main() -> None:
             or args.ref_temp != 20.0
             or args.relative_to_ref
             or args.interp
-            or args.plot_weight != 100.0
+            or str(args.plot_weight) != "100"
+            or bool(args.compare_raw_compensated)
+            or bool(args.compare_modes)
         )
         if used_plot_related_args:
             print(

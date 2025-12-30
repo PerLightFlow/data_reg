@@ -41,6 +41,12 @@ python train_model.py --csv data/数据整理.xlsx --output models/model.json
 python train_model.py --csv data/数据整理.xlsx --sheet 1 --output models/model.json
 ```
 
+如果只想用部分样机的数据训练，可加 `--devices`（逗号分隔或区间）：
+
+```bash
+python train_model.py --csv data/数据整理.xlsx --devices 1-3,7 --output models/model_subset.json
+```
+
 ## 单次计算（命令行）
 
 ```bash

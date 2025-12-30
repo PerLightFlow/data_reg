@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="XLSX 工作表（名称或1-based序号），默认读取所有匹配的工作表；CSV 时忽略",
     )
     p.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="指定用于训练的样机编号（例如 '1,2,3' 或 '1-3,7'），默认使用全部设备",
+    )
+    p.add_argument(
         "--output",
         type=str,
         default="models/model.json",
@@ -34,6 +40,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ref-temp", type=float, default=20.0, help="基准实际温度（默认 20°C）")
     p.add_argument("--robust", action="store_true", help="使用 Huber IRLS 做鲁棒拟合（默认关闭）")
     return p
+
+
+def _parse_device_ids(expr: str) -> Tuple[int, ...]:
+    """
+    解析样机编号列表：
+    - '1,2,3'
+    - '1-3,7'
+    """
+
+    expr = (expr or "").strip()
+    if not expr:
+        return tuple()
+
+    ids = set()
+    for part in expr.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            if a == "" or b == "":
+                raise ValueError(f"Invalid devices range: {part!r}")
+            start = int(a)
+            end = int(b)
+            if start > end:
+                start, end = end, start
+            for v in range(start, end + 1):
+                ids.add(int(v))
+        else:
+            ids.add(int(part))
+
+    return tuple(sorted(ids))
 
 
 def _fit_line(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
@@ -98,6 +135,21 @@ def main() -> None:
         raise SystemExit(f"数据文件缺少列: {sorted(missing)}")
 
     device_ids = sorted(df["样机编号"].unique().tolist())
+    if args.devices:
+        try:
+            device_filter = _parse_device_ids(args.devices)
+        except ValueError as e:
+            raise SystemExit(str(e))
+
+        available = set(int(x) for x in device_ids)
+        requested = set(int(x) for x in device_filter)
+        not_found = sorted(requested - available)
+        if not_found:
+            raise SystemExit(f"devices 中包含数据里不存在的样机编号: {not_found}；可用: {sorted(available)}")
+
+        df = df[df["样机编号"].isin(sorted(requested))].copy()
+        device_ids = sorted(df["样机编号"].unique().tolist())
+
     calibrations: Dict[int, Dict[str, float]] = {}
     for device_id in device_ids:
         calibrations[int(device_id)] = _infer_device_calibration_at_ref_temp(
