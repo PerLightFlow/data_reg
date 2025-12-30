@@ -45,13 +45,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--error-mode",
-        choices=["raw", "norm20", "compensated"],
+        choices=["raw", "norm20", "compensated", "signal_corrected"],
         default="norm20",
         help=(
             "误差计算方式：raw=信号-真实重量；"
             "norm20=按20°C(S0,S100)归一后的读数-真实重量；"
-            "compensated=归一+温度补偿后的读数-真实重量"
+            "compensated=归一+温度补偿后的读数-真实重量；"
+            "signal_corrected=信号修正后归一化的读数-真实重量"
         ),
+    )
+    p.add_argument(
+        "--beta",
+        type=float,
+        default=-0.00017,
+        help="信号修正的增益温漂系数 (默认 -0.00017)",
+    )
+    p.add_argument(
+        "--gamma",
+        type=float,
+        default=-0.006,
+        help="信号修正的零点温漂系数 (默认 -0.006)",
     )
     p.add_argument(
         "--compare-raw-compensated",
@@ -154,9 +167,9 @@ def _parse_compare_modes(expr: str) -> tuple[str, str]:
     raw = (expr or "").strip().lower().replace(" ", "")
     parts = [p for p in raw.split(",") if p]
     if len(parts) != 2:
-        raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,compensated'：当前={expr!r}")
+        raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,signal_corrected'：当前={expr!r}")
 
-    valid = {"raw", "norm20", "compensated"}
+    valid = {"raw", "norm20", "compensated", "signal_corrected"}
     a, b = parts[0], parts[1]
     if a not in valid or b not in valid:
         raise ValueError(f"--compare-modes 只支持 {sorted(valid)}：当前={expr!r}")
@@ -207,6 +220,8 @@ def _prepare_error_dataframe(
     model_path: str,
     relative_to_ref: bool,
     calibration_df: pd.DataFrame | None = None,
+    beta: float = -0.00017,
+    gamma: float = -0.006,
 ) -> pd.DataFrame:
     df = df.copy()
 
@@ -223,6 +238,12 @@ def _prepare_error_dataframe(
 
         if error_mode == "norm20":
             df["measured"] = df["W20"]
+        elif error_mode == "signal_corrected":
+            # 信号修正模式: S_corrected = S0 + (S_raw - S0 - γ×dT) / (1 + β×dT)
+            dT = (df["芯片温度"].to_numpy(float) - df["T20"].to_numpy(float)).astype(float)
+            s_corrected = s0 + (s - s0 - gamma * dT) / (1 + beta * dT)
+            # 用修正后的信号计算 W20
+            df["measured"] = (s_corrected - s0) * 100.0 / (s100 - s0)
         elif error_mode == "compensated":
             import json
             from pathlib import Path
@@ -243,6 +264,11 @@ def _prepare_error_dataframe(
                 from weight_compensation import Piecewise2DModel
 
                 model = Piecewise2DModel.from_dict(model_data)
+                df["measured"] = model.compensate_w20(w20, d)
+            elif model_type == "high_order_polynomial":
+                from weight_compensation import HighOrderPolynomialModel
+
+                model = HighOrderPolynomialModel.from_dict(model_data)
                 df["measured"] = model.compensate_w20(w20, d)
             else:
                 from weight_compensation import CompensationModel
@@ -334,6 +360,8 @@ def _plot_temp_drift(
     relative_to_ref: bool,
     interp: bool,
     compare_modes: tuple[str, str] | None,
+    beta: float = -0.00017,
+    gamma: float = -0.006,
 ) -> None:
     from pathlib import Path
 
@@ -348,7 +376,7 @@ def _plot_temp_drift(
     out_path.mkdir(parents=True, exist_ok=True)
 
     calibration_df: pd.DataFrame | None = None
-    if compare_modes is not None or error_mode in ("norm20", "compensated"):
+    if compare_modes is not None or error_mode in ("norm20", "compensated", "signal_corrected"):
         calibration_df = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
 
     if compare_modes is not None:
@@ -360,6 +388,8 @@ def _plot_temp_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
         df_b = _prepare_error_dataframe(
             df,
@@ -368,6 +398,8 @@ def _plot_temp_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
     else:
         df_err = _prepare_error_dataframe(
@@ -377,6 +409,8 @@ def _plot_temp_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
 
     ylabel = "误差（测得-真实, g）"
@@ -387,7 +421,7 @@ def _plot_temp_drift(
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected"}[error_mode]
 
     for device_id in sorted(df["样机编号"].unique().tolist()):
         if compare_modes is not None:
@@ -479,6 +513,8 @@ def _plot_all_devices_drift(
     compare_modes: tuple[str, str] | None,
     xlim: tuple[float, float] | None = None,
     ylim: tuple[float, float] | None = None,
+    beta: float = -0.00017,
+    gamma: float = -0.006,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """
     将所有设备叠加到同一张图：
@@ -510,6 +546,8 @@ def _plot_all_devices_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
         if "T20" not in df_a.columns:
             df_a = df_a.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -522,6 +560,8 @@ def _plot_all_devices_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
         if "T20" not in df_b.columns:
             df_b = df_b.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -540,6 +580,8 @@ def _plot_all_devices_drift(
             model_path=model_path,
             relative_to_ref=relative_to_ref,
             calibration_df=calibration_df,
+            beta=beta,
+            gamma=gamma,
         )
         if "T20" not in df_err.columns:
             df_err = df_err.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -558,7 +600,7 @@ def _plot_all_devices_drift(
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected"}[error_mode]
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
@@ -729,6 +771,8 @@ def main() -> None:
             relative_to_ref=bool(args.relative_to_ref),
             interp=bool(args.interp),
             compare_modes=compare_modes,
+            beta=float(args.beta),
+            gamma=float(args.gamma),
         )
         print(f"\nDrift plots saved to: {args.out_dir}")
         plotted_any = True
@@ -754,6 +798,8 @@ def main() -> None:
                     interp=bool(args.interp),
                     plot_weight=float(w),
                     compare_modes=compare_modes,
+                    beta=float(args.beta),
+                    gamma=float(args.gamma),
                 )
                 all_xlims.append(xlim_i)
                 all_ylims.append(ylim_i)
@@ -776,6 +822,8 @@ def main() -> None:
                     compare_modes=compare_modes,
                     xlim=global_xlim,
                     ylim=global_ylim,
+                    beta=float(args.beta),
+                    gamma=float(args.gamma),
                 )
         else:
             # 单张图或不统一坐标轴：直接绘制
@@ -790,6 +838,8 @@ def main() -> None:
                     interp=bool(args.interp),
                     plot_weight=float(w),
                     compare_modes=compare_modes,
+                    beta=float(args.beta),
+                    gamma=float(args.gamma),
                 )
 
         print(f"\nAll-devices drift plot saved to: {args.out_dir}")

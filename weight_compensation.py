@@ -604,3 +604,191 @@ def fit_piecewise_2d_model(
         dT_boundaries=tuple(dT_boundaries),
         w20_boundaries=tuple(w20_boundaries),
     )
+
+
+# ============================================================
+# 高阶多项式模型
+# ============================================================
+
+
+@dataclass(frozen=True)
+class HighOrderPolynomialModel:
+    """
+    高阶多项式温度补偿模型。
+
+    模型形式（平衡多项式，8个参数）：
+        compensation = a1*d + a2*w + a3*d² + a4*d*w + a5*w² + a6*d³ + a7*d²*w + a8*d*w²
+        w_corr = w20 + compensation
+
+    其中：
+        d = dT = T_chip - T20 (芯片温度差)
+        w = w20 (归一化后的重量读数)
+    """
+
+    a1: float  # d 系数
+    a2: float  # w 系数
+    a3: float  # d² 系数
+    a4: float  # d*w 系数
+    a5: float  # w² 系数
+    a6: float  # d³ 系数
+    a7: float  # d²*w 系数
+    a8: float  # d*w² 系数
+    version: str = "v1"
+
+    def compensate_w20(
+        self, w20: Union[float, np.ndarray], dT: Union[float, np.ndarray]
+    ) -> Union[float, np.ndarray]:
+        d = np.asarray(dT, dtype=float)
+        w = np.asarray(w20, dtype=float)
+
+        d2 = d * d
+        d3 = d2 * d
+        w2 = w * w
+
+        compensation = (
+            self.a1 * d
+            + self.a2 * w
+            + self.a3 * d2
+            + self.a4 * d * w
+            + self.a5 * w2
+            + self.a6 * d3
+            + self.a7 * d2 * w
+            + self.a8 * d * w2
+        )
+        return w + compensation
+
+    def compensate_signal(
+        self,
+        *,
+        s_raw: Union[float, np.ndarray],
+        t_chip: Union[float, np.ndarray],
+        calibration: DeviceCalibration,
+    ) -> Union[float, np.ndarray]:
+        w20 = calibration.normalize_to_20c(s_raw)
+        dT = calibration.delta_chip_temp(t_chip)
+        return self.compensate_w20(w20, dT)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "type": "high_order_polynomial",
+            "version": self.version,
+            "formula": "w_corr = w20 + a1*d + a2*w + a3*d² + a4*d*w + a5*w² + a6*d³ + a7*d²*w + a8*d*w²",
+            "coefficients": {
+                "a1": self.a1,
+                "a2": self.a2,
+                "a3": self.a3,
+                "a4": self.a4,
+                "a5": self.a5,
+                "a6": self.a6,
+                "a7": self.a7,
+                "a8": self.a8,
+            },
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "HighOrderPolynomialModel":
+        if d.get("type") != "high_order_polynomial":
+            raise ValueError(f"Unsupported model type: {d.get('type')!r}")
+        coeff = d.get("coefficients") or {}
+        return HighOrderPolynomialModel(
+            a1=float(coeff.get("a1", 0)),
+            a2=float(coeff.get("a2", 0)),
+            a3=float(coeff.get("a3", 0)),
+            a4=float(coeff.get("a4", 0)),
+            a5=float(coeff.get("a5", 0)),
+            a6=float(coeff.get("a6", 0)),
+            a7=float(coeff.get("a7", 0)),
+            a8=float(coeff.get("a8", 0)),
+            version=str(d.get("version") or "v1"),
+        )
+
+    def save_json(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def load_json(path: Union[str, Path]) -> "HighOrderPolynomialModel":
+        path = Path(path)
+        return HighOrderPolynomialModel.from_dict(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+
+
+def fit_high_order_polynomial_model(
+    w_true: np.ndarray,
+    w20: np.ndarray,
+    dT: np.ndarray,
+    *,
+    robust: bool = False,
+    huber_delta: float = 1.5,
+    max_iter: int = 50,
+) -> HighOrderPolynomialModel:
+    """
+    高阶多项式拟合：
+        y = a1*d + a2*w + a3*d² + a4*d*w + a5*w² + a6*d³ + a7*d²*w + a8*d*w²
+
+    补偿公式：w_corr = w20 + y
+
+    参数:
+        w_true: 真实重量
+        w20: 归一化后的重量读数（20°C 标尺）
+        dT: 芯片温度差 (T_chip - T20)
+        robust: 是否使用 Huber IRLS 鲁棒拟合
+        huber_delta: Huber 损失的阈值
+        max_iter: 鲁棒拟合最大迭代次数
+
+    返回:
+        HighOrderPolynomialModel
+    """
+    w_true = np.asarray(w_true, dtype=float)
+    w20 = np.asarray(w20, dtype=float)
+    dT = np.asarray(dT, dtype=float)
+
+    if not (len(w_true) == len(w20) == len(dT)):
+        raise ValueError("w_true, w20, dT must have the same length.")
+
+    y = w_true - w20  # 需要补偿的量
+    d = dT
+    w = w20
+
+    d2 = d * d
+    d3 = d2 * d
+    w2 = w * w
+
+    # 构建设计矩阵: [d, w, d², d*w, w², d³, d²*w, d*w²]
+    X = np.column_stack([d, w, d2, d * w, w2, d3, d2 * w, d * w2])
+
+    if not robust:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        a1, a2, a3, a4, a5, a6, a7, a8 = (float(v) for v in coef)
+        return HighOrderPolynomialModel(
+            a1=a1, a2=a2, a3=a3, a4=a4, a5=a5, a6=a6, a7=a7, a8=a8
+        )
+
+    # Huber IRLS 鲁棒拟合
+    weights = np.ones(len(y), dtype=float)
+    coef = np.zeros(X.shape[1], dtype=float)
+    for _ in range(max_iter):
+        W = weights[:, None]
+        coef_new, *_ = np.linalg.lstsq(X * W, y * weights, rcond=None)
+
+        if np.allclose(coef, coef_new, rtol=0, atol=1e-10):
+            coef = coef_new
+            break
+
+        coef = coef_new
+        resid = y - X @ coef
+        scale = float(np.median(np.abs(resid))) / 0.6745 if len(resid) else 1.0
+        scale = max(scale, 1e-12)
+
+        r = resid / (scale * huber_delta)
+        weights = np.ones(len(r), dtype=float)
+        mask = np.abs(r) > 1.0
+        weights[mask] = 1.0 / np.abs(r[mask])
+
+    a1, a2, a3, a4, a5, a6, a7, a8 = (float(v) for v in coef)
+    return HighOrderPolynomialModel(
+        a1=a1, a2=a2, a3=a3, a4=a4, a5=a5, a6=a6, a7=a7, a8=a8
+    )

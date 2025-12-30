@@ -6,7 +6,14 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
-from weight_compensation import CompensationModel, fit_compensation_model, r2_score, rmse
+from weight_compensation import (
+    CompensationModel,
+    HighOrderPolynomialModel,
+    fit_compensation_model,
+    fit_high_order_polynomial_model,
+    r2_score,
+    rmse,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--ref-temp", type=float, default=20.0, help="基准实际温度（默认 20°C）")
     p.add_argument("--robust", action="store_true", help="使用 Huber IRLS 做鲁棒拟合（默认关闭）")
+    p.add_argument(
+        "--high-order",
+        action="store_true",
+        help="使用高阶多项式模型（8参数）替代默认的2阶模型（4参数）",
+    )
     return p
 
 
@@ -176,7 +188,16 @@ def main() -> None:
     w20 = np.asarray(w20, dtype=float)
     d = np.asarray(d, dtype=float)
 
-    model = fit_compensation_model(w_true=w_true, w20=w20, d=d, robust=bool(args.robust))
+    # 根据参数选择模型类型
+    if args.high_order:
+        model = fit_high_order_polynomial_model(
+            w_true=w_true, w20=w20, dT=d, robust=bool(args.robust)
+        )
+        model_name = "高阶多项式模型（8参数）"
+    else:
+        model = fit_compensation_model(w_true=w_true, w20=w20, d=d, robust=bool(args.robust))
+        model_name = "标准模型（4参数）"
+
     w_pred = model.compensate_w20(w20, d)
 
     base_r2 = r2_score(w_true, w20)
@@ -191,9 +212,11 @@ def main() -> None:
             f"device={int(device_id)}: T20={cal['t20']:.6f}, S0={cal['s0']:.6f}, S100={cal['s100']:.6f}"
         )
 
+    print(f"\n=== 模型类型: {model_name} ===")
     print("\n=== Metrics ===")
     print(f"baseline (only 20°C normalize): R2={base_r2:.4f}, RMSE={base_rmse:.4f}")
     print(f"after compensation:             R2={pred_r2:.4f}, RMSE={pred_rmse:.4f}")
+    print(f"RMSE improvement: {base_rmse - pred_rmse:.4f}g ({(base_rmse - pred_rmse) / base_rmse * 100:.1f}%)")
 
     print("\n=== Model ===")
     print(json.dumps(model.to_dict(), ensure_ascii=False, indent=2))
