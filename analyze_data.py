@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="对离散点做线性插值绘制更平滑曲线（仍是线性，不改变数据）",
     )
+    p.add_argument(
+        "--unified-axis",
+        action="store_true",
+        help="绘制多张图时统一坐标轴范围，便于对比",
+    )
     return p
 
 
@@ -219,12 +224,26 @@ def _prepare_error_dataframe(
         if error_mode == "norm20":
             df["measured"] = df["W20"]
         elif error_mode == "compensated":
-            from weight_compensation import CompensationModel
+            import json
+            from pathlib import Path
 
-            model = CompensationModel.load_json(model_path)
+            # 自动检测模型类型
+            model_data = json.loads(Path(model_path).read_text(encoding="utf-8"))
+            model_type = model_data.get("type", "")
+
             d = (df["芯片温度"].to_numpy(float) - df["T20"].to_numpy(float)).astype(float)
             w20 = df["W20"].to_numpy(float)
-            df["measured"] = model.compensate_w20(w20, d)
+
+            if model_type == "piecewise_linear_dT":
+                from weight_compensation import PiecewiseLinearModel
+
+                model = PiecewiseLinearModel.from_dict(model_data)
+                df["measured"] = model.compensate_w20(w20, d)
+            else:
+                from weight_compensation import CompensationModel
+
+                model = CompensationModel.from_dict(model_data)
+                df["measured"] = model.compensate_w20(w20, d)
         else:
             raise ValueError(f"Unsupported error_mode: {error_mode!r}")
 
@@ -453,7 +472,9 @@ def _plot_all_devices_drift(
     interp: bool,
     plot_weight: float,
     compare_modes: tuple[str, str] | None,
-) -> None:
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+) -> tuple[tuple[float, float], tuple[float, float]]:
     """
     将所有设备叠加到同一张图：
     - 横轴：芯片温度差值 dT = Tchip - T20（T20 由 ref_temp 下数据推导）
@@ -583,6 +604,20 @@ def _plot_all_devices_drift(
                 yi = np.interp(xi, x, y)
                 ax.plot(xi, yi, linewidth=2.2, alpha=0.5, color=color)
 
+    # 获取当前图的数据范围
+    current_xlim = ax.get_xlim()
+    current_ylim = ax.get_ylim()
+
+    # 如果指定了统一的坐标轴范围，则使用
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    # 设置 y 轴刻度为 10 的整数倍
+    from matplotlib.ticker import MultipleLocator
+    ax.yaxis.set_major_locator(MultipleLocator(10))
+
     ax.set_xlabel(f"芯片温度差值 ΔT = Tchip - T20(ref={ref_temp:g}°C)")
     ax.set_ylabel(ylabel)
     ax.set_title(f"所有样机温漂曲线（重量={plot_weight:g}g, mode={mode_desc}）")
@@ -605,6 +640,8 @@ def _plot_all_devices_drift(
     fig.tight_layout()
     fig.savefig(str(out_path / fname), dpi=150)
     plt.close(fig)
+
+    return (current_xlim, current_ylim)
 
 
 def main() -> None:
@@ -694,18 +731,62 @@ def main() -> None:
     if args.plot_all_devices:
         available_weights = sorted(df["重量"].unique().tolist())
         weights_to_plot = _parse_plot_weight_expr(str(args.plot_weight), available_weights)
-        for w in weights_to_plot:
-            _plot_all_devices_drift(
-                df,
-                out_dir=args.out_dir,
-                error_mode=args.error_mode,
-                ref_temp=float(args.ref_temp),
-                model_path=args.model,
-                relative_to_ref=bool(args.relative_to_ref),
-                interp=bool(args.interp),
-                plot_weight=float(w),
-                compare_modes=compare_modes,
-            )
+
+        if args.unified_axis and len(weights_to_plot) > 1:
+            # 多张图且开启统一坐标轴：先遍历收集全局坐标范围，再统一绘制
+            all_xlims: list[tuple[float, float]] = []
+            all_ylims: list[tuple[float, float]] = []
+
+            # 第一遍：收集各图的数据范围
+            for w in weights_to_plot:
+                xlim_i, ylim_i = _plot_all_devices_drift(
+                    df,
+                    out_dir=args.out_dir,
+                    error_mode=args.error_mode,
+                    ref_temp=float(args.ref_temp),
+                    model_path=args.model,
+                    relative_to_ref=bool(args.relative_to_ref),
+                    interp=bool(args.interp),
+                    plot_weight=float(w),
+                    compare_modes=compare_modes,
+                )
+                all_xlims.append(xlim_i)
+                all_ylims.append(ylim_i)
+
+            # 计算全局统一范围
+            global_xlim = (min(x[0] for x in all_xlims), max(x[1] for x in all_xlims))
+            global_ylim = (min(y[0] for y in all_ylims), max(y[1] for y in all_ylims))
+
+            # 第二遍：用统一范围重新绘制
+            for w in weights_to_plot:
+                _plot_all_devices_drift(
+                    df,
+                    out_dir=args.out_dir,
+                    error_mode=args.error_mode,
+                    ref_temp=float(args.ref_temp),
+                    model_path=args.model,
+                    relative_to_ref=bool(args.relative_to_ref),
+                    interp=bool(args.interp),
+                    plot_weight=float(w),
+                    compare_modes=compare_modes,
+                    xlim=global_xlim,
+                    ylim=global_ylim,
+                )
+        else:
+            # 单张图或不统一坐标轴：直接绘制
+            for w in weights_to_plot:
+                _plot_all_devices_drift(
+                    df,
+                    out_dir=args.out_dir,
+                    error_mode=args.error_mode,
+                    ref_temp=float(args.ref_temp),
+                    model_path=args.model,
+                    relative_to_ref=bool(args.relative_to_ref),
+                    interp=bool(args.interp),
+                    plot_weight=float(w),
+                    compare_modes=compare_modes,
+                )
+
         print(f"\nAll-devices drift plot saved to: {args.out_dir}")
         plotted_any = True
 

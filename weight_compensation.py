@@ -125,6 +125,198 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+@dataclass
+class PiecewiseSegment:
+    """
+    分段线性模型的单个分段。
+
+    补偿公式: compensation = k0 * dT + k1 * dT * w20 + c
+    即: w_corr = w20 + k0 * dT + k1 * dT * w20 + c
+    """
+
+    dT_min: Optional[float]  # None 表示负无穷
+    dT_max: Optional[float]  # None 表示正无穷
+    k0: float  # dT 的系数（与重量无关）
+    k1: float  # dT * w20 的系数（与重量相关）
+    c: float  # 截距
+
+    def contains(self, dT: float) -> bool:
+        lower_ok = self.dT_min is None or dT >= self.dT_min
+        upper_ok = self.dT_max is None or dT < self.dT_max
+        return lower_ok and upper_ok
+
+    def to_dict(self) -> JsonDict:
+        return {"dT_min": self.dT_min, "dT_max": self.dT_max, "k0": self.k0, "k1": self.k1, "c": self.c}
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "PiecewiseSegment":
+        # 兼容旧格式（只有 k，没有 k0/k1）
+        if "k" in d and "k0" not in d:
+            return PiecewiseSegment(
+                dT_min=d.get("dT_min"),
+                dT_max=d.get("dT_max"),
+                k0=float(d["k"]),
+                k1=0.0,
+                c=float(d["c"]),
+            )
+        return PiecewiseSegment(
+            dT_min=d.get("dT_min"),
+            dT_max=d.get("dT_max"),
+            k0=float(d["k0"]),
+            k1=float(d.get("k1", 0.0)),
+            c=float(d["c"]),
+        )
+
+
+@dataclass
+class PiecewiseLinearModel:
+    """
+    分段线性温度补偿模型。
+
+    模型形式：
+        w_corr = w20 + k_i * dT + c_i
+
+    其中 dT = T_chip - T20，根据 dT 所在区间选择对应的 (k_i, c_i)。
+    """
+
+    segments: Tuple[PiecewiseSegment, ...]
+    version: str = "v1"
+
+    def _find_segment(self, dT: float) -> PiecewiseSegment:
+        for seg in self.segments:
+            if seg.contains(dT):
+                return seg
+        # fallback: 返回最后一个分段
+        return self.segments[-1]
+
+    def compensate_w20(
+        self, w20: Union[float, np.ndarray], dT: Union[float, np.ndarray]
+    ) -> Union[float, np.ndarray]:
+        w20 = np.asarray(w20, dtype=float)
+        dT = np.asarray(dT, dtype=float)
+        scalar_input = w20.ndim == 0 and dT.ndim == 0
+
+        w20 = np.atleast_1d(w20)
+        dT = np.atleast_1d(dT)
+
+        result = np.zeros_like(w20)
+        for i, (w, d) in enumerate(zip(w20, dT)):
+            seg = self._find_segment(float(d))
+            # w_corr = w20 + k0 * dT + k1 * dT * w20 + c
+            result[i] = w + seg.k0 * d + seg.k1 * d * w + seg.c
+
+        return float(result[0]) if scalar_input else result
+
+    def compensate_signal(
+        self,
+        *,
+        s_raw: Union[float, np.ndarray],
+        t_chip: Union[float, np.ndarray],
+        calibration: DeviceCalibration,
+    ) -> Union[float, np.ndarray]:
+        w20 = calibration.normalize_to_20c(s_raw)
+        dT = calibration.delta_chip_temp(t_chip)
+        return self.compensate_w20(w20, dT)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "type": "piecewise_linear_dT",
+            "version": self.version,
+            "formula": "w_corr = w20 + k_i * dT + c_i (dT = T_chip - T20)",
+            "segments": [seg.to_dict() for seg in self.segments],
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "PiecewiseLinearModel":
+        if d.get("type") != "piecewise_linear_dT":
+            raise ValueError(f"Unsupported model type: {d.get('type')!r}")
+        segments = tuple(PiecewiseSegment.from_dict(s) for s in d.get("segments", []))
+        return PiecewiseLinearModel(
+            segments=segments,
+            version=str(d.get("version") or "v1"),
+        )
+
+    def save_json(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def load_json(path: Union[str, Path]) -> "PiecewiseLinearModel":
+        path = Path(path)
+        return PiecewiseLinearModel.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+# 默认分段边界
+DEFAULT_DT_BOUNDARIES = [-1200, -400, 400, 1200, 2000]
+
+
+def fit_piecewise_linear_model(
+    w_true: np.ndarray,
+    w20: np.ndarray,
+    dT: np.ndarray,
+    *,
+    boundaries: Optional[Iterable[float]] = None,
+) -> PiecewiseLinearModel:
+    """
+    分段线性拟合：在每个 dT 区间内独立拟合 y = k0 * dT + k1 * dT * w20 + c
+
+    补偿公式：w_corr = w20 + k0 * dT + k1 * dT * w20 + c
+
+    参数:
+        w_true: 真实重量
+        w20: 归一化后的重量读数（20°C 标尺）
+        dT: 芯片温度差 (T_chip - T20)
+        boundaries: 分段边界列表，如 [-1200, -400, 400, 1200, 2000]
+
+    返回:
+        PiecewiseLinearModel
+    """
+    w_true = np.asarray(w_true, dtype=float)
+    w20 = np.asarray(w20, dtype=float)
+    dT = np.asarray(dT, dtype=float)
+
+    if boundaries is None:
+        boundaries = DEFAULT_DT_BOUNDARIES
+    boundaries = sorted(boundaries)
+
+    # 构建分段区间: (-inf, b0), [b0, b1), ..., [bn, +inf)
+    edges = [None] + boundaries + [None]
+    segments = []
+
+    y = w_true - w20  # 需要补偿的量
+
+    for i in range(len(edges) - 1):
+        dT_min = edges[i]
+        dT_max = edges[i + 1]
+
+        # 选择该区间内的数据
+        if dT_min is None and dT_max is None:
+            mask = np.ones(len(dT), dtype=bool)
+        elif dT_min is None:
+            mask = dT < dT_max
+        elif dT_max is None:
+            mask = dT >= dT_min
+        else:
+            mask = (dT >= dT_min) & (dT < dT_max)
+
+        dT_seg = dT[mask]
+        w20_seg = w20[mask]
+        y_seg = y[mask]
+
+        if len(dT_seg) < 3:
+            # 数据不足，使用默认值
+            k0, k1, c = 0.0, 0.0, 0.0
+        else:
+            # 线性拟合: y = k0 * dT + k1 * dT * w20 + c
+            A = np.column_stack([dT_seg, dT_seg * w20_seg, np.ones(len(dT_seg))])
+            coef, *_ = np.linalg.lstsq(A, y_seg, rcond=None)
+            k0, k1, c = float(coef[0]), float(coef[1]), float(coef[2])
+
+        segments.append(PiecewiseSegment(dT_min=dT_min, dT_max=dT_max, k0=k0, k1=k1, c=c))
+
+    return PiecewiseLinearModel(segments=tuple(segments))
+
+
 def fit_compensation_model(
     w_true: np.ndarray,
     w20: np.ndarray,
