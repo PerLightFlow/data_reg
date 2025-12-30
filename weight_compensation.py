@@ -373,3 +373,234 @@ def fit_compensation_model(
 
     a0, a1, b0, b1 = (float(v) for v in coef)
     return CompensationModel(a0=a0, a1=a1, b0=b0, b1=b1)
+
+
+# ============================================================
+# 二维分段模型（按 dT 和 w20 同时分段）
+# ============================================================
+
+# 默认二维分段边界
+DEFAULT_DT_BOUNDARIES_2D = [-1000, 1000, 2000]
+DEFAULT_W20_BOUNDARIES = [75, 150, 250]
+
+
+@dataclass
+class Piecewise2DCell:
+    """
+    二维分段模型的单个网格单元。
+
+    补偿公式: compensation = k * dT + c
+    即: w_corr = w20 + k * dT + c
+    """
+
+    dT_min: Optional[float]
+    dT_max: Optional[float]
+    w20_min: Optional[float]
+    w20_max: Optional[float]
+    k: float  # dT 的系数
+    c: float  # 截距
+
+    def contains(self, dT: float, w20: float) -> bool:
+        dT_ok = (self.dT_min is None or dT >= self.dT_min) and (
+            self.dT_max is None or dT < self.dT_max
+        )
+        w20_ok = (self.w20_min is None or w20 >= self.w20_min) and (
+            self.w20_max is None or w20 < self.w20_max
+        )
+        return dT_ok and w20_ok
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "dT_min": self.dT_min,
+            "dT_max": self.dT_max,
+            "w20_min": self.w20_min,
+            "w20_max": self.w20_max,
+            "k": self.k,
+            "c": self.c,
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "Piecewise2DCell":
+        return Piecewise2DCell(
+            dT_min=d.get("dT_min"),
+            dT_max=d.get("dT_max"),
+            w20_min=d.get("w20_min"),
+            w20_max=d.get("w20_max"),
+            k=float(d["k"]),
+            c=float(d["c"]),
+        )
+
+
+@dataclass
+class Piecewise2DModel:
+    """
+    二维分段温度补偿模型（按 dT 和 w20 同时分段）。
+
+    模型形式：
+        w_corr = w20 + k * dT + c
+
+    根据 (dT, w20) 所在的网格单元选择对应的 (k, c)。
+    """
+
+    cells: Tuple[Piecewise2DCell, ...]
+    dT_boundaries: Tuple[float, ...]
+    w20_boundaries: Tuple[float, ...]
+    version: str = "v1"
+
+    def _find_cell(self, dT: float, w20: float) -> Piecewise2DCell:
+        for cell in self.cells:
+            if cell.contains(dT, w20):
+                return cell
+        # fallback: 返回最后一个单元
+        return self.cells[-1]
+
+    def compensate_w20(
+        self, w20: Union[float, np.ndarray], dT: Union[float, np.ndarray]
+    ) -> Union[float, np.ndarray]:
+        w20 = np.asarray(w20, dtype=float)
+        dT = np.asarray(dT, dtype=float)
+        scalar_input = w20.ndim == 0 and dT.ndim == 0
+
+        w20 = np.atleast_1d(w20)
+        dT = np.atleast_1d(dT)
+
+        result = np.zeros_like(w20)
+        for i, (w, d) in enumerate(zip(w20, dT)):
+            cell = self._find_cell(float(d), float(w))
+            result[i] = w + cell.k * d + cell.c
+
+        return float(result[0]) if scalar_input else result
+
+    def compensate_signal(
+        self,
+        *,
+        s_raw: Union[float, np.ndarray],
+        t_chip: Union[float, np.ndarray],
+        calibration: DeviceCalibration,
+    ) -> Union[float, np.ndarray]:
+        w20 = calibration.normalize_to_20c(s_raw)
+        dT = calibration.delta_chip_temp(t_chip)
+        return self.compensate_w20(w20, dT)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "type": "piecewise_2d",
+            "version": self.version,
+            "formula": "w_corr = w20 + k * dT + c (segmented by dT and w20)",
+            "dT_boundaries": list(self.dT_boundaries),
+            "w20_boundaries": list(self.w20_boundaries),
+            "cells": [cell.to_dict() for cell in self.cells],
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "Piecewise2DModel":
+        if d.get("type") != "piecewise_2d":
+            raise ValueError(f"Unsupported model type: {d.get('type')!r}")
+        cells = tuple(Piecewise2DCell.from_dict(c) for c in d.get("cells", []))
+        return Piecewise2DModel(
+            cells=cells,
+            dT_boundaries=tuple(d.get("dT_boundaries", [])),
+            w20_boundaries=tuple(d.get("w20_boundaries", [])),
+            version=str(d.get("version") or "v1"),
+        )
+
+    def save_json(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def load_json(path: Union[str, Path]) -> "Piecewise2DModel":
+        path = Path(path)
+        return Piecewise2DModel.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def fit_piecewise_2d_model(
+    w_true: np.ndarray,
+    w20: np.ndarray,
+    dT: np.ndarray,
+    *,
+    dT_boundaries: Optional[Iterable[float]] = None,
+    w20_boundaries: Optional[Iterable[float]] = None,
+) -> Piecewise2DModel:
+    """
+    二维分段线性拟合：在每个 (dT, w20) 网格单元内独立拟合 y = k * dT + c
+
+    补偿公式：w_corr = w20 + k * dT + c
+
+    参数:
+        w_true: 真实重量
+        w20: 归一化后的重量读数（20°C 标尺）
+        dT: 芯片温度差 (T_chip - T20)
+        dT_boundaries: dT 分段边界列表
+        w20_boundaries: w20 分段边界列表
+
+    返回:
+        Piecewise2DModel
+    """
+    w_true = np.asarray(w_true, dtype=float)
+    w20 = np.asarray(w20, dtype=float)
+    dT = np.asarray(dT, dtype=float)
+
+    if dT_boundaries is None:
+        dT_boundaries = DEFAULT_DT_BOUNDARIES_2D
+    if w20_boundaries is None:
+        w20_boundaries = DEFAULT_W20_BOUNDARIES
+
+    dT_boundaries = sorted(dT_boundaries)
+    w20_boundaries = sorted(w20_boundaries)
+
+    # 构建边界: (-inf, b0), [b0, b1), ..., [bn, +inf)
+    dT_edges = [None] + list(dT_boundaries) + [None]
+    w20_edges = [None] + list(w20_boundaries) + [None]
+
+    y = w_true - w20  # 需要补偿的量
+    cells = []
+
+    for i in range(len(dT_edges) - 1):
+        dT_min = dT_edges[i]
+        dT_max = dT_edges[i + 1]
+
+        for j in range(len(w20_edges) - 1):
+            w20_min = w20_edges[j]
+            w20_max = w20_edges[j + 1]
+
+            # 选择该网格单元内的数据
+            mask = np.ones(len(dT), dtype=bool)
+            if dT_min is not None:
+                mask &= dT >= dT_min
+            if dT_max is not None:
+                mask &= dT < dT_max
+            if w20_min is not None:
+                mask &= w20 >= w20_min
+            if w20_max is not None:
+                mask &= w20 < w20_max
+
+            dT_seg = dT[mask]
+            y_seg = y[mask]
+
+            if len(dT_seg) < 2:
+                k, c = 0.0, 0.0
+            else:
+                # 线性拟合: y = k * dT + c
+                A = np.column_stack([dT_seg, np.ones(len(dT_seg))])
+                coef, *_ = np.linalg.lstsq(A, y_seg, rcond=None)
+                k, c = float(coef[0]), float(coef[1])
+
+            cells.append(
+                Piecewise2DCell(
+                    dT_min=dT_min,
+                    dT_max=dT_max,
+                    w20_min=w20_min,
+                    w20_max=w20_max,
+                    k=k,
+                    c=c,
+                )
+            )
+
+    return Piecewise2DModel(
+        cells=tuple(cells),
+        dT_boundaries=tuple(dT_boundaries),
+        w20_boundaries=tuple(w20_boundaries),
+    )

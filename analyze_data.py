@@ -239,6 +239,11 @@ def _prepare_error_dataframe(
 
                 model = PiecewiseLinearModel.from_dict(model_data)
                 df["measured"] = model.compensate_w20(w20, d)
+            elif model_type == "piecewise_2d":
+                from weight_compensation import Piecewise2DModel
+
+                model = Piecewise2DModel.from_dict(model_data)
+                df["measured"] = model.compensate_w20(w20, d)
             else:
                 from weight_compensation import CompensationModel
 
