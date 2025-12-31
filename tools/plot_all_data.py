@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--x-axis",
         type=str,
         choices=["dT", "chip_temp", "actual_temp"],
-        default="chip_temp",
+        default="dT",
         help="X轴: dT=芯片温度差, chip_temp=芯片温度, actual_temp=实际温度",
     )
     p.add_argument(
