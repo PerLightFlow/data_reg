@@ -792,3 +792,435 @@ def fit_high_order_polynomial_model(
     return HighOrderPolynomialModel(
         a1=a1, a2=a2, a3=a3, a4=a4, a5=a5, a6=a6, a7=a7, a8=a8
     )
+
+
+# ==============================================================================
+# 分段二次补偿模型
+# ==============================================================================
+
+
+@dataclass
+class PiecewiseQuadraticSegment:
+    """
+    分段二次模型的单个分段。
+
+    公式: y = a * dT² + b * dT + c
+    """
+
+    dT_min: float
+    dT_max: float
+    a: float  # 二次项系数
+    b: float  # 一次项系数
+    c: float  # 常数项
+
+    def predict(self, dT: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        dT = np.asarray(dT, dtype=float)
+        return self.a * dT**2 + self.b * dT + self.c
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "dT_min": self.dT_min,
+            "dT_max": self.dT_max,
+            "a": self.a,
+            "b": self.b,
+            "c": self.c,
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "PiecewiseQuadraticSegment":
+        return PiecewiseQuadraticSegment(
+            dT_min=float(d["dT_min"]),
+            dT_max=float(d["dT_max"]),
+            a=float(d["a"]),
+            b=float(d["b"]),
+            c=float(d["c"]),
+        )
+
+
+@dataclass
+class PiecewiseQuadraticWeightParams:
+    """
+    单个重量级别的分段二次参数。
+    """
+
+    weight: float  # 重量值 (如 100g)
+    knots: Tuple[float, ...]  # 分段点
+    segments: Tuple[PiecewiseQuadraticSegment, ...]  # 分段参数
+    s_ref: float  # 基准信号值 (dT=0 时的信号)
+    std: float  # 残差标准差
+
+    def _find_segment(self, dT: float) -> PiecewiseQuadraticSegment:
+        for seg in self.segments:
+            if seg.dT_min <= dT < seg.dT_max:
+                return seg
+        # 边界处理：超出范围使用边界段
+        if dT < self.segments[0].dT_min:
+            return self.segments[0]
+        return self.segments[-1]
+
+    def predict(self, dT: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        """预测给定 dT 下的信号值"""
+        dT = np.asarray(dT, dtype=float)
+        scalar_input = dT.ndim == 0
+        dT = np.atleast_1d(dT)
+
+        result = np.zeros_like(dT)
+        for i, d in enumerate(dT):
+            seg = self._find_segment(float(d))
+            result[i] = seg.predict(d)
+
+        return float(result[0]) if scalar_input else result
+
+    def compute_drift(self, dT: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        """计算漂移量: drift = predict(dT) - predict(0)"""
+        return self.predict(dT) - self.s_ref
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "weight": self.weight,
+            "knots": list(self.knots),
+            "segments": [seg.to_dict() for seg in self.segments],
+            "s_ref": self.s_ref,
+            "std": self.std,
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "PiecewiseQuadraticWeightParams":
+        return PiecewiseQuadraticWeightParams(
+            weight=float(d["weight"]),
+            knots=tuple(d["knots"]),
+            segments=tuple(
+                PiecewiseQuadraticSegment.from_dict(s) for s in d["segments"]
+            ),
+            s_ref=float(d["s_ref"]),
+            std=float(d["std"]),
+        )
+
+
+@dataclass
+class PiecewiseQuadraticModel:
+    """
+    分段二次温度补偿模型。
+
+    特点：
+    - 按重量级别分别存储参数
+    - 支持按信号范围自动选择参数
+    - 推理时只需传入信号值和 dT
+
+    补偿公式：
+        S_corrected = S_raw - drift
+        drift = predict(dT) - predict(0)
+    """
+
+    weight_params: Tuple[PiecewiseQuadraticWeightParams, ...]
+    n_segments: int
+    version: str = "v1"
+
+    def _find_weight_params(
+        self, signal: float
+    ) -> PiecewiseQuadraticWeightParams:
+        """
+        根据信号值选择最近的重量参数。
+        使用 s_ref（基准信号值）来匹配。
+        """
+        # 找到 s_ref 最接近 signal 的重量参数
+        best = None
+        best_dist = float("inf")
+        for wp in self.weight_params:
+            dist = abs(signal - wp.s_ref)
+            if dist < best_dist:
+                best_dist = dist
+                best = wp
+        return best if best is not None else self.weight_params[0]
+
+    def compensate_signal(
+        self,
+        signal: Union[float, np.ndarray],
+        dT: Union[float, np.ndarray],
+    ) -> Union[float, np.ndarray]:
+        """
+        补偿信号值。
+
+        参数:
+            signal: 原始信号值
+            dT: 温度偏差 (T_chip - T20)
+
+        返回:
+            补偿后的信号值
+        """
+        signal = np.asarray(signal, dtype=float)
+        dT = np.asarray(dT, dtype=float)
+        scalar_input = signal.ndim == 0 and dT.ndim == 0
+
+        signal = np.atleast_1d(signal)
+        dT = np.atleast_1d(dT)
+
+        result = np.zeros_like(signal)
+        for i, (s, d) in enumerate(zip(signal, dT)):
+            wp = self._find_weight_params(float(s))
+            drift = wp.compute_drift(float(d))
+            result[i] = s - drift
+
+        return float(result[0]) if scalar_input else result
+
+    def compensate_w20(
+        self,
+        w20: Union[float, np.ndarray],
+        dT: Union[float, np.ndarray],
+        s0: float = 0.0,
+        s100: float = 100.0,
+    ) -> Union[float, np.ndarray]:
+        """
+        补偿归一化后的重量读数。
+
+        参数:
+            w20: 归一化后的重量读数 (20°C 标尺)
+            dT: 温度偏差 (T_chip - T20)
+            s0: 零点信号
+            s100: 100g 信号
+
+        返回:
+            补偿后的重量读数
+        """
+        # 将 w20 转换为信号值
+        signal = s0 + w20 * (s100 - s0) / 100.0
+        # 补偿信号
+        signal_corrected = self.compensate_signal(signal, dT)
+        # 转换回 w20
+        return (signal_corrected - s0) * 100.0 / (s100 - s0)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "type": "piecewise_quadratic",
+            "version": self.version,
+            "formula": "S_corrected = S_raw - (predict(dT) - predict(0)), 按重量分段二次",
+            "n_segments": self.n_segments,
+            "weight_params": [wp.to_dict() for wp in self.weight_params],
+        }
+
+    @staticmethod
+    def from_dict(d: JsonDict) -> "PiecewiseQuadraticModel":
+        if d.get("type") != "piecewise_quadratic":
+            raise ValueError(f"Unsupported model type: {d.get('type')!r}")
+        return PiecewiseQuadraticModel(
+            weight_params=tuple(
+                PiecewiseQuadraticWeightParams.from_dict(wp)
+                for wp in d.get("weight_params", [])
+            ),
+            n_segments=int(d.get("n_segments", 3)),
+            version=str(d.get("version") or "v1"),
+        )
+
+    def save_json(self, path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def load_json(path: Union[str, Path]) -> "PiecewiseQuadraticModel":
+        path = Path(path)
+        return PiecewiseQuadraticModel.from_dict(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+
+
+def _fit_piecewise_quadratic_single(
+    x: np.ndarray, y: np.ndarray, n_segments: int = 3
+) -> Tuple[np.ndarray, list, float]:
+    """
+    单个重量级别的分段二次拟合（带连续性约束）。
+
+    返回: (knots, coefficients, std)
+    """
+    sort_idx = np.argsort(x)
+    x_sorted = x[sort_idx]
+    y_sorted = y[sort_idx]
+
+    # 自动确定分段点
+    knots = [float(x_sorted.min())]
+    for i in range(1, n_segments):
+        q = i / n_segments
+        knots.append(float(np.percentile(x_sorted, q * 100)))
+    knots.append(float(x_sorted.max()))
+    knots = np.array(knots)
+
+    n_params = 3 * n_segments
+
+    # 数据矩阵
+    A_data = []
+    b_data = []
+
+    for i in range(n_segments):
+        x_min, x_max = knots[i], knots[i + 1]
+        if i < n_segments - 1:
+            mask = (x_sorted >= x_min) & (x_sorted < x_max)
+        else:
+            mask = (x_sorted >= x_min) & (x_sorted <= x_max)
+
+        x_seg = x_sorted[mask]
+        y_seg = y_sorted[mask]
+
+        for xi, yi in zip(x_seg, y_seg):
+            row = np.zeros(n_params)
+            row[3 * i] = xi**2
+            row[3 * i + 1] = xi
+            row[3 * i + 2] = 1
+            A_data.append(row)
+            b_data.append(yi)
+
+    A_data = np.array(A_data)
+    b_data = np.array(b_data)
+
+    # 约束矩阵
+    A_eq = []
+    b_eq = []
+
+    for j in range(n_segments - 1):
+        k = knots[j + 1]
+
+        # 值连续
+        row_val = np.zeros(n_params)
+        row_val[3 * j] = k**2
+        row_val[3 * j + 1] = k
+        row_val[3 * j + 2] = 1
+        row_val[3 * (j + 1)] = -k**2
+        row_val[3 * (j + 1) + 1] = -k
+        row_val[3 * (j + 1) + 2] = -1
+        A_eq.append(row_val)
+        b_eq.append(0)
+
+        # 导数连续
+        row_deriv = np.zeros(n_params)
+        row_deriv[3 * j] = 2 * k
+        row_deriv[3 * j + 1] = 1
+        row_deriv[3 * (j + 1)] = -2 * k
+        row_deriv[3 * (j + 1) + 1] = -1
+        A_eq.append(row_deriv)
+        b_eq.append(0)
+
+    A_eq = np.array(A_eq)
+    b_eq = np.array(b_eq)
+
+    # KKT 求解
+    if len(A_eq) > 0:
+        ATA = A_data.T @ A_data
+        ATb = A_data.T @ b_data
+
+        n_eq = len(b_eq)
+        KKT = np.zeros((n_params + n_eq, n_params + n_eq))
+        KKT[:n_params, :n_params] = ATA
+        KKT[:n_params, n_params:] = A_eq.T
+        KKT[n_params:, :n_params] = A_eq
+
+        rhs = np.concatenate([ATb, b_eq])
+
+        try:
+            solution = np.linalg.solve(KKT, rhs)
+            params = solution[:n_params]
+        except np.linalg.LinAlgError:
+            params = np.linalg.lstsq(KKT, rhs, rcond=None)[0][:n_params]
+    else:
+        params = np.linalg.lstsq(A_data, b_data, rcond=None)[0]
+
+    # 提取系数
+    coefficients = []
+    for i in range(n_segments):
+        a, b, c = params[3 * i], params[3 * i + 1], params[3 * i + 2]
+        coefficients.append((float(a), float(b), float(c)))
+
+    # 计算残差
+    y_pred = np.zeros_like(x)
+    for i in range(n_segments):
+        x_min, x_max = knots[i], knots[i + 1]
+        if i < n_segments - 1:
+            mask = (x >= x_min) & (x < x_max)
+        else:
+            mask = (x >= x_min) & (x <= x_max)
+        if i == 0:
+            mask |= x < x_min
+        if i == n_segments - 1:
+            mask |= x > x_max
+
+        a, b, c = coefficients[i]
+        y_pred[mask] = a * x[mask] ** 2 + b * x[mask] + c
+
+    std = float(np.std(y - y_pred))
+
+    return knots, coefficients, std
+
+
+def fit_piecewise_quadratic_model(
+    signal: np.ndarray,
+    dT: np.ndarray,
+    weight: np.ndarray,
+    *,
+    n_segments: int = 3,
+) -> PiecewiseQuadraticModel:
+    """
+    拟合分段二次补偿模型。
+
+    参数:
+        signal: 原始信号值
+        dT: 温度偏差 (T_chip - T20)
+        weight: 真实重量
+        n_segments: 分段数量
+
+    返回:
+        PiecewiseQuadraticModel
+    """
+    signal = np.asarray(signal, dtype=float)
+    dT = np.asarray(dT, dtype=float)
+    weight = np.asarray(weight, dtype=float)
+
+    weight_params_list = []
+    for w in sorted(set(weight)):
+        mask = weight == w
+        dT_w = dT[mask]
+        signal_w = signal[mask]
+
+        # 分段二次拟合
+        knots, coefficients, std = _fit_piecewise_quadratic_single(
+            dT_w, signal_w, n_segments=n_segments
+        )
+
+        # 构建 segments
+        segments = []
+        for i in range(n_segments):
+            a, b, c = coefficients[i]
+            seg = PiecewiseQuadraticSegment(
+                dT_min=float(knots[i]),
+                dT_max=float(knots[i + 1]),
+                a=a,
+                b=b,
+                c=c,
+            )
+            segments.append(seg)
+
+        # 计算基准信号 (dT=0 时)
+        # 找到包含 dT=0 的段
+        s_ref = None
+        for seg in segments:
+            if seg.dT_min <= 0 <= seg.dT_max:
+                s_ref = seg.predict(0.0)
+                break
+        if s_ref is None:
+            # dT=0 不在数据范围内，用最近的段
+            if 0 < segments[0].dT_min:
+                s_ref = segments[0].predict(segments[0].dT_min)
+            else:
+                s_ref = segments[-1].predict(segments[-1].dT_max)
+
+        wp = PiecewiseQuadraticWeightParams(
+            weight=float(w),
+            knots=tuple(float(k) for k in knots),
+            segments=tuple(segments),
+            s_ref=float(s_ref),
+            std=std,
+        )
+        weight_params_list.append(wp)
+
+    return PiecewiseQuadraticModel(
+        weight_params=tuple(weight_params_list),
+        n_segments=n_segments,
+    )

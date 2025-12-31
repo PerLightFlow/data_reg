@@ -9,8 +9,10 @@ import pandas as pd
 from weight_compensation import (
     CompensationModel,
     HighOrderPolynomialModel,
+    PiecewiseQuadraticModel,
     fit_compensation_model,
     fit_high_order_polynomial_model,
+    fit_piecewise_quadratic_model,
     r2_score,
     rmse,
 )
@@ -50,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--high-order",
         action="store_true",
         help="使用高阶多项式模型（8参数）替代默认的2阶模型（4参数）",
+    )
+    p.add_argument(
+        "--piecewise-quadratic",
+        action="store_true",
+        help="使用分段二次非线性补偿模型（按重量分别拟合）",
+    )
+    p.add_argument(
+        "--n-segments",
+        type=int,
+        default=3,
+        help="分段二次模型的分段数量（默认 3）",
     )
     return p
 
@@ -188,17 +201,33 @@ def main() -> None:
     w20 = np.asarray(w20, dtype=float)
     d = np.asarray(d, dtype=float)
 
+    # 获取原始信号用于分段二次模型
+    signal = df["信号"].to_numpy(float)
+
     # 根据参数选择模型类型
-    if args.high_order:
+    if args.piecewise_quadratic:
+        model = fit_piecewise_quadratic_model(
+            signal=signal, dT=d, weight=w_true, n_segments=args.n_segments
+        )
+        model_name = f"分段二次非线性模型（{args.n_segments}段）"
+        # 计算补偿后的信号并转换为重量
+        signal_corrected = model.compensate_signal(signal, d)
+        # 需要用各设备的 s0/s100 转换回重量
+        w_pred = np.zeros_like(w_true)
+        for i, (_, r) in enumerate(df.iterrows()):
+            device_id = int(r["样机编号"])
+            cal = calibrations[device_id]
+            w_pred[i] = (signal_corrected[i] - cal["s0"]) * 100.0 / (cal["s100"] - cal["s0"])
+    elif args.high_order:
         model = fit_high_order_polynomial_model(
             w_true=w_true, w20=w20, dT=d, robust=bool(args.robust)
         )
         model_name = "高阶多项式模型（8参数）"
+        w_pred = model.compensate_w20(w20, d)
     else:
         model = fit_compensation_model(w_true=w_true, w20=w20, d=d, robust=bool(args.robust))
         model_name = "标准模型（4参数）"
-
-    w_pred = model.compensate_w20(w20, d)
+        w_pred = model.compensate_w20(w20, d)
 
     base_r2 = r2_score(w_true, w20)
     base_rmse = rmse(w_true, w20)

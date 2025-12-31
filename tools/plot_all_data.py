@@ -115,6 +115,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="在图上显示每个区间带的边界公式 (需配合 --show-bands 使用)",
     )
+    p.add_argument(
+        "--quadratic-bands",
+        action="store_true",
+        help="使用分段二次非线性拟合替代线性拟合 (自动分段+连续约束)",
+    )
+    p.add_argument(
+        "--n-segments",
+        type=int,
+        default=3,
+        help="分段数量 (默认 3，用于 --quadratic-bands)",
+    )
     return p
 
 
@@ -136,6 +147,165 @@ def correct_signal(s_raw: np.ndarray, dT: np.ndarray, s0: np.ndarray,
         修正后的信号值
     """
     return s0 + (s_raw - s0 - gamma * dT) / (1 + beta * dT)
+
+
+def fit_piecewise_quadratic(x: np.ndarray, y: np.ndarray, n_segments: int = 3):
+    """
+    分段二次拟合，带连续性约束（值连续+导数连续）。
+
+    参数:
+        x: X 轴数据
+        y: Y 轴数据
+        n_segments: 分段数量
+
+    返回:
+        dict: {
+            'knots': 分段点列表,
+            'coefficients': [(a, b, c), ...] 每段的系数 y = a*x² + b*x + c,
+            'std': 残差标准差,
+            'predict': 预测函数
+        }
+    """
+    # 按 x 排序
+    sort_idx = np.argsort(x)
+    x_sorted = x[sort_idx]
+    y_sorted = y[sort_idx]
+
+    # 自动确定分段点（基于数据分位数）
+    knots = [x_sorted.min()]
+    for i in range(1, n_segments):
+        q = i / n_segments
+        knots.append(np.percentile(x_sorted, q * 100))
+    knots.append(x_sorted.max())
+    knots = np.array(knots)
+
+    # 构建约束最小二乘问题
+    # 每段: y = a_i * x² + b_i * x + c_i
+    # 连续性约束: 在分段点 k_j，相邻段的值和导数相等
+    # 值连续: a_i * k_j² + b_i * k_j + c_i = a_{i+1} * k_j² + b_{i+1} * k_j + c_{i+1}
+    # 导数连续: 2*a_i * k_j + b_i = 2*a_{i+1} * k_j + b_{i+1}
+
+    n_params = 3 * n_segments  # 每段 3 个参数 (a, b, c)
+    n_constraints = 2 * (n_segments - 1)  # 每个内部分段点 2 个约束
+
+    # 数据矩阵
+    A_data = []
+    b_data = []
+
+    for i in range(n_segments):
+        x_min, x_max = knots[i], knots[i + 1]
+        mask = (x_sorted >= x_min) & (x_sorted <= x_max)
+        if i < n_segments - 1:
+            mask = (x_sorted >= x_min) & (x_sorted < x_max)
+
+        x_seg = x_sorted[mask]
+        y_seg = y_sorted[mask]
+
+        for xi, yi in zip(x_seg, y_seg):
+            row = np.zeros(n_params)
+            row[3 * i] = xi ** 2     # a_i
+            row[3 * i + 1] = xi      # b_i
+            row[3 * i + 2] = 1       # c_i
+            A_data.append(row)
+            b_data.append(yi)
+
+    A_data = np.array(A_data)
+    b_data = np.array(b_data)
+
+    # 约束矩阵 (值连续 + 导数连续)
+    A_eq = []
+    b_eq = []
+
+    for j in range(n_segments - 1):
+        k = knots[j + 1]  # 分段点
+
+        # 值连续: a_i * k² + b_i * k + c_i - a_{i+1} * k² - b_{i+1} * k - c_{i+1} = 0
+        row_val = np.zeros(n_params)
+        row_val[3 * j] = k ** 2
+        row_val[3 * j + 1] = k
+        row_val[3 * j + 2] = 1
+        row_val[3 * (j + 1)] = -k ** 2
+        row_val[3 * (j + 1) + 1] = -k
+        row_val[3 * (j + 1) + 2] = -1
+        A_eq.append(row_val)
+        b_eq.append(0)
+
+        # 导数连续: 2*a_i * k + b_i - 2*a_{i+1} * k - b_{i+1} = 0
+        row_deriv = np.zeros(n_params)
+        row_deriv[3 * j] = 2 * k
+        row_deriv[3 * j + 1] = 1
+        row_deriv[3 * (j + 1)] = -2 * k
+        row_deriv[3 * (j + 1) + 1] = -1
+        A_eq.append(row_deriv)
+        b_eq.append(0)
+
+    A_eq = np.array(A_eq)
+    b_eq = np.array(b_eq)
+
+    # 使用带约束的最小二乘求解
+    # 构建 KKT 系统: [A'A  A_eq'] [params ]   [A'b]
+    #               [A_eq  0   ] [lambda ] = [b_eq]
+    if len(A_eq) > 0:
+        ATA = A_data.T @ A_data
+        ATb = A_data.T @ b_data
+
+        n_eq = len(b_eq)
+        KKT = np.zeros((n_params + n_eq, n_params + n_eq))
+        KKT[:n_params, :n_params] = ATA
+        KKT[:n_params, n_params:] = A_eq.T
+        KKT[n_params:, :n_params] = A_eq
+
+        rhs = np.concatenate([ATb, b_eq])
+
+        try:
+            solution = np.linalg.solve(KKT, rhs)
+            params = solution[:n_params]
+        except np.linalg.LinAlgError:
+            # 如果 KKT 系统奇异，使用伪逆
+            params = np.linalg.lstsq(KKT, rhs, rcond=None)[0][:n_params]
+    else:
+        params = np.linalg.lstsq(A_data, b_data, rcond=None)[0]
+
+    # 提取每段系数
+    coefficients = []
+    for i in range(n_segments):
+        a, b, c = params[3 * i], params[3 * i + 1], params[3 * i + 2]
+        coefficients.append((a, b, c))
+
+    # 定义预测函数
+    def predict(x_new):
+        x_new = np.atleast_1d(x_new)
+        y_pred = np.zeros_like(x_new, dtype=float)
+
+        for i in range(n_segments):
+            x_min, x_max = knots[i], knots[i + 1]
+            if i < n_segments - 1:
+                mask = (x_new >= x_min) & (x_new < x_max)
+            else:
+                mask = (x_new >= x_min) & (x_new <= x_max)
+
+            # 处理边界外的点
+            if i == 0:
+                mask |= (x_new < x_min)
+            if i == n_segments - 1:
+                mask |= (x_new > x_max)
+
+            a, b, c = coefficients[i]
+            y_pred[mask] = a * x_new[mask] ** 2 + b * x_new[mask] + c
+
+        return y_pred
+
+    # 计算残差标准差
+    y_pred = predict(x)
+    std = np.std(y - y_pred)
+
+    return {
+        'knots': knots,
+        'coefficients': coefficients,
+        'std': std,
+        'predict': predict,
+        'n_segments': n_segments,
+    }
 
 
 def compute_weight_bands(df: pd.DataFrame, x_col: str, y_col: str) -> dict:
@@ -406,38 +576,107 @@ def main():
             weights = sorted(set(w_true))
             colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
 
-            for w, c in zip(weights, colors):
-                mask = w_true == w
-                # 用空心圆绘制修正后的数据
-                ax.scatter(x_data[mask], signal_corrected[mask], facecolors='none',
-                          edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
+            # 根据是否启用分段二次补偿，选择不同的修正方式
+            if args.quadratic_bands:
+                # ========== 分段二次补偿 ==========
+                # 为每个重量级别计算分段二次拟合，然后用于修正
+                piecewise_fits = {}
+                signal_corrected_pw = np.zeros_like(signal)
 
-            # 计算并绘制修正后数据的区间带 (虚线)
-            if args.show_bands:
-                # 为修正后的数据计算新的区间带
-                x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
+                print(f"\n{'=' * 60}")
+                print(f"分段二次补偿 ({args.n_segments} 段)")
+                print(f"{'=' * 60}")
 
-                for w, c in zip(weights, colors):
+                for w in weights:
                     mask = w_true == w
                     x_pts = x_data[mask]
-                    y_pts = signal_corrected[mask]
+                    y_pts = signal[mask]
 
-                    # 线性拟合修正后的数据
-                    A = np.column_stack([x_pts, np.ones(len(x_pts))])
-                    coef, _, _, _ = np.linalg.lstsq(A, y_pts, rcond=None)
-                    slope, intercept = coef
-                    std = np.std(y_pts - (slope * x_pts + intercept))
+                    # 分段二次拟合: signal = a*dT² + b*dT + c
+                    result = fit_piecewise_quadratic(x_pts, y_pts, n_segments=args.n_segments)
+                    piecewise_fits[w] = result
 
-                    center = slope * x_range + intercept
-                    upper = center + args.band_sigma * std
-                    lower = center - args.band_sigma * std
+                    # 修正公式: S_corrected = S_raw - 漂移量
+                    # 漂移量 = a*dT² + b*dT (相对于 dT=0 时的偏移)
+                    # 即 S_corrected = S_raw - (predict(dT) - predict(0))
+                    s_at_zero = result['predict'](np.array([0.0]))[0]  # dT=0 时的基准信号
+                    s_predicted = result['predict'](x_pts)  # 当前 dT 的预测信号
+                    drift = s_predicted - s_at_zero  # 漂移量
 
-                    # 用虚线绘制修正后的区间带
-                    ax.plot(x_range, center, color=c, linestyle='--', linewidth=2, alpha=0.8)
-                    ax.fill_between(x_range, lower, upper, color=c, alpha=0.05,
-                                   hatch='///', edgecolor=c, linewidth=0)
+                    signal_corrected_pw[mask] = signal[mask] - drift
 
-            print(f"修正后数据已绘制 (β={args.beta}, γ={args.gamma})")
+                    # 计算修正效果
+                    rmse_before = np.std(y_pts - result['predict'](x_pts))
+                    rmse_after = np.std(signal_corrected_pw[mask] - s_at_zero)
+                    print(f"【{int(w)}g】基准信号(dT=0): {s_at_zero:.2f}, 修正后 RMSE: {rmse_after:.4f}")
+
+                print(f"{'=' * 60}")
+
+                # 绘制修正后的数据（空心圆）
+                for w, c in zip(weights, colors):
+                    mask = w_true == w
+                    ax.scatter(x_data[mask], signal_corrected_pw[mask], facecolors='none',
+                              edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
+
+                # 绘制修正后数据的区间带 (虚线 + 水平，因为修正后应该是平的)
+                if args.show_bands or args.quadratic_bands:
+                    x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
+
+                    for w, c in zip(weights, colors):
+                        mask = w_true == w
+                        y_corrected = signal_corrected_pw[mask]
+
+                        # 线性拟合修正后的数据（理想情况应该是水平线）
+                        A = np.column_stack([x_data[mask], np.ones(mask.sum())])
+                        coef, _, _, _ = np.linalg.lstsq(A, y_corrected, rcond=None)
+                        slope, intercept = coef
+                        std = np.std(y_corrected - (slope * x_data[mask] + intercept))
+
+                        center = slope * x_range + intercept
+                        upper = center + args.band_sigma * std
+                        lower = center - args.band_sigma * std
+
+                        # 用虚线绘制修正后的区间带
+                        ax.plot(x_range, center, color=c, linestyle='--', linewidth=2, alpha=0.8)
+                        ax.fill_between(x_range, lower, upper, color=c, alpha=0.05,
+                                       hatch='///', edgecolor=c, linewidth=0)
+
+                print(f"分段二次补偿数据已绘制 ({args.n_segments} 段)")
+
+            else:
+                # ========== 原有 β/γ 补偿 ==========
+                for w, c in zip(weights, colors):
+                    mask = w_true == w
+                    # 用空心圆绘制修正后的数据
+                    ax.scatter(x_data[mask], signal_corrected[mask], facecolors='none',
+                              edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
+
+                # 计算并绘制修正后数据的区间带 (虚线)
+                if args.show_bands:
+                    # 为修正后的数据计算新的区间带
+                    x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
+
+                    for w, c in zip(weights, colors):
+                        mask = w_true == w
+                        x_pts = x_data[mask]
+                        y_pts = signal_corrected[mask]
+
+                        # 线性拟合修正后的数据
+                        A = np.column_stack([x_pts, np.ones(len(x_pts))])
+                        coef, _, _, _ = np.linalg.lstsq(A, y_pts, rcond=None)
+                        slope, intercept = coef
+                        std = np.std(y_pts - (slope * x_pts + intercept))
+
+                        center = slope * x_range + intercept
+                        upper = center + args.band_sigma * std
+                        lower = center - args.band_sigma * std
+
+                        # 用虚线绘制修正后的区间带
+                        ax.plot(x_range, center, color=c, linestyle='--', linewidth=2, alpha=0.8)
+                        ax.fill_between(x_range, lower, upper, color=c, alpha=0.05,
+                                       hatch='///', edgecolor=c, linewidth=0)
+
+                print(f"修正后数据已绘制 (β={args.beta}, γ={args.gamma})")
 
         # 绘制区间带 (如果启用)
         if args.show_bands and args.color_by == "weight" and not args.show_corrected:
@@ -541,11 +780,90 @@ def main():
 
             print(f"区间带已绘制 (±{args.band_sigma}σ)")
 
+        # 绘制分段二次区间带 (如果启用)
+        if args.quadratic_bands and args.color_by == "weight" and not args.show_corrected:
+            x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 500)
+            weights = sorted(set(w_true))
+            colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
+
+            # 根据 x_axis 类型选择公式中的变量名
+            x_var_map = {"chip_temp": "T", "dT": "dT", "actual_temp": "t"}
+            x_var = x_var_map.get(args.x_axis, "x")
+
+            # 收集公式信息
+            quad_formula_lines = []
+
+            print(f"\n{'=' * 60}")
+            print(f"分段二次非线性拟合 ({args.n_segments} 段, 连续约束)")
+            print(f"{'=' * 60}")
+
+            for w, c in zip(weights, colors):
+                mask = w_true == w
+                x_pts = x_data[mask]
+                y_pts = y_data[mask]
+
+                # 分段二次拟合
+                result = fit_piecewise_quadratic(x_pts, y_pts, n_segments=args.n_segments)
+
+                # 预测中心线
+                center = result['predict'](x_range)
+                upper = center + args.band_sigma * result['std']
+                lower = center - args.band_sigma * result['std']
+
+                # 绘制中心线（曲线）
+                ax.plot(x_range, center, color=c, linestyle='-', linewidth=2, alpha=0.8)
+                # 绘制区间带
+                ax.fill_between(x_range, lower, upper, color=c, alpha=0.12)
+
+                # 在分段点处绘制垂直虚线
+                for knot in result['knots'][1:-1]:
+                    ax.axvline(x=knot, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+
+                # 保存公式信息
+                quad_formula_lines.append({
+                    'weight': int(w),
+                    'knots': result['knots'],
+                    'coefficients': result['coefficients'],
+                    'std': result['std'],
+                    'n_segments': result['n_segments'],
+                })
+
+                # 打印公式
+                print(f"\n【{int(w)}g】 σ = {result['std']:.4f}")
+                print(f"  分段点: {', '.join([f'{k:.1f}' for k in result['knots']])}")
+                for i, (a, b, c_coef) in enumerate(result['coefficients']):
+                    x_min, x_max = result['knots'][i], result['knots'][i + 1]
+                    print(f"  段{i + 1} [{x_min:.0f}, {x_max:.0f}]: y = {a:.2e}*{x_var}² + {b:.6f}*{x_var} + {c_coef:.2f}")
+
+            print(f"{'=' * 60}")
+
+            # 如果启用 --show-formulas，在图上标注公式
+            if args.show_formulas:
+                formula_text = f"Piecewise Quadratic ({args.n_segments} seg):\n"
+                formula_text += "-" * 36 + "\n"
+
+                for f in quad_formula_lines:
+                    formula_text += f"\n{f['weight']}g (s={f['std']:.2f}):\n"
+                    for i, (a, b, c_coef) in enumerate(f['coefficients']):
+                        x_min, x_max = f['knots'][i], f['knots'][i + 1]
+                        formula_text += f"  [{x_min:.0f},{x_max:.0f}]:\n"
+                        formula_text += f"    {a:.1e}*{x_var}^2\n"
+                        formula_text += f"    {'+' if b >= 0 else ''}{b:.4f}*{x_var}\n"
+                        formula_text += f"    {'+' if c_coef >= 0 else ''}{c_coef:.1f}\n"
+
+                ax.text(1.02, 0.98, formula_text, transform=ax.transAxes, fontsize=7,
+                        verticalalignment='top', fontfamily='monospace',
+                        bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9))
+
+            print(f"分段二次区间带已绘制 (±{args.band_sigma}σ)")
+
         ax.set_xlabel(x_label, fontsize=12)
         ax.set_ylabel(y_label, fontsize=12)
         title = f"数据分布图 (共 {len(df)} 个数据点, {len(device_ids)} 台设备)"
         if args.show_bands:
             title += f" [区间带: ±{args.band_sigma}σ]"
+        if args.quadratic_bands:
+            title += f" [分段二次: {args.n_segments}段]"
         ax.set_title(title, fontsize=14)
         ax.grid(True, alpha=0.3)
 
@@ -555,8 +873,8 @@ def main():
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
         # 如果显示公式，需要预留右侧空间
-        if args.show_formulas and args.show_bands:
-            plt.tight_layout(rect=[0, 0, 0.75, 1])  # 右侧留25%空间给公式
+        if args.show_formulas and (args.show_bands or args.quadratic_bands):
+            plt.tight_layout(rect=[0, 0, 0.72, 1])  # 右侧留28%空间给公式
         else:
             plt.tight_layout()
 

@@ -45,14 +45,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--error-mode",
-        choices=["raw", "norm20", "compensated", "signal_corrected"],
+        choices=["raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic"],
         default="norm20",
         help=(
             "误差计算方式：raw=信号-真实重量；"
             "norm20=按20°C(S0,S100)归一后的读数-真实重量；"
             "compensated=归一+温度补偿后的读数-真实重量；"
-            "signal_corrected=信号修正后归一化的读数-真实重量"
+            "signal_corrected=信号修正后归一化的读数-真实重量；"
+            "piecewise_quadratic=分段二次非线性补偿后的读数-真实重量"
         ),
+    )
+    p.add_argument(
+        "--n-segments",
+        type=int,
+        default=3,
+        help="分段二次补偿的分段数量 (默认 3，用于 --error-mode piecewise_quadratic)",
+    )
+    p.add_argument(
+        "--piecewise-model",
+        type=str,
+        default=None,
+        help="分段二次模型的 JSON 路径（用于 --error-mode piecewise_quadratic，指定后将加载预训练模型而非重新拟合）",
     )
     p.add_argument(
         "--beta",
@@ -118,6 +131,155 @@ def _fit_line(x: np.ndarray, y: np.ndarray):
     return float(a), float(b)
 
 
+def fit_piecewise_quadratic(x: np.ndarray, y: np.ndarray, n_segments: int = 3):
+    """
+    分段二次拟合，带连续性约束（值连续+导数连续）。
+
+    参数:
+        x: X 轴数据
+        y: Y 轴数据
+        n_segments: 分段数量
+
+    返回:
+        dict: {
+            'knots': 分段点列表,
+            'coefficients': [(a, b, c), ...] 每段的系数 y = a*x² + b*x + c,
+            'std': 残差标准差,
+            'predict': 预测函数
+        }
+    """
+    # 按 x 排序
+    sort_idx = np.argsort(x)
+    x_sorted = x[sort_idx]
+    y_sorted = y[sort_idx]
+
+    # 自动确定分段点（基于数据分位数）
+    knots = [x_sorted.min()]
+    for i in range(1, n_segments):
+        q = i / n_segments
+        knots.append(np.percentile(x_sorted, q * 100))
+    knots.append(x_sorted.max())
+    knots = np.array(knots)
+
+    n_params = 3 * n_segments  # 每段 3 个参数 (a, b, c)
+
+    # 数据矩阵
+    A_data = []
+    b_data = []
+
+    for i in range(n_segments):
+        x_min, x_max = knots[i], knots[i + 1]
+        mask = (x_sorted >= x_min) & (x_sorted <= x_max)
+        if i < n_segments - 1:
+            mask = (x_sorted >= x_min) & (x_sorted < x_max)
+
+        x_seg = x_sorted[mask]
+        y_seg = y_sorted[mask]
+
+        for xi, yi in zip(x_seg, y_seg):
+            row = np.zeros(n_params)
+            row[3 * i] = xi ** 2     # a_i
+            row[3 * i + 1] = xi      # b_i
+            row[3 * i + 2] = 1       # c_i
+            A_data.append(row)
+            b_data.append(yi)
+
+    A_data = np.array(A_data)
+    b_data = np.array(b_data)
+
+    # 约束矩阵 (值连续 + 导数连续)
+    A_eq = []
+    b_eq = []
+
+    for j in range(n_segments - 1):
+        k = knots[j + 1]  # 分段点
+
+        # 值连续
+        row_val = np.zeros(n_params)
+        row_val[3 * j] = k ** 2
+        row_val[3 * j + 1] = k
+        row_val[3 * j + 2] = 1
+        row_val[3 * (j + 1)] = -k ** 2
+        row_val[3 * (j + 1) + 1] = -k
+        row_val[3 * (j + 1) + 2] = -1
+        A_eq.append(row_val)
+        b_eq.append(0)
+
+        # 导数连续
+        row_deriv = np.zeros(n_params)
+        row_deriv[3 * j] = 2 * k
+        row_deriv[3 * j + 1] = 1
+        row_deriv[3 * (j + 1)] = -2 * k
+        row_deriv[3 * (j + 1) + 1] = -1
+        A_eq.append(row_deriv)
+        b_eq.append(0)
+
+    A_eq = np.array(A_eq)
+    b_eq = np.array(b_eq)
+
+    # 使用带约束的最小二乘求解
+    if len(A_eq) > 0:
+        ATA = A_data.T @ A_data
+        ATb = A_data.T @ b_data
+
+        n_eq = len(b_eq)
+        KKT = np.zeros((n_params + n_eq, n_params + n_eq))
+        KKT[:n_params, :n_params] = ATA
+        KKT[:n_params, n_params:] = A_eq.T
+        KKT[n_params:, :n_params] = A_eq
+
+        rhs = np.concatenate([ATb, b_eq])
+
+        try:
+            solution = np.linalg.solve(KKT, rhs)
+            params = solution[:n_params]
+        except np.linalg.LinAlgError:
+            params = np.linalg.lstsq(KKT, rhs, rcond=None)[0][:n_params]
+    else:
+        params = np.linalg.lstsq(A_data, b_data, rcond=None)[0]
+
+    # 提取每段系数
+    coefficients = []
+    for i in range(n_segments):
+        a, b, c = params[3 * i], params[3 * i + 1], params[3 * i + 2]
+        coefficients.append((a, b, c))
+
+    # 定义预测函数
+    def predict(x_new):
+        x_new = np.atleast_1d(x_new)
+        y_pred = np.zeros_like(x_new, dtype=float)
+
+        for i in range(n_segments):
+            x_min, x_max = knots[i], knots[i + 1]
+            if i < n_segments - 1:
+                mask = (x_new >= x_min) & (x_new < x_max)
+            else:
+                mask = (x_new >= x_min) & (x_new <= x_max)
+
+            # 处理边界外的点
+            if i == 0:
+                mask |= (x_new < x_min)
+            if i == n_segments - 1:
+                mask |= (x_new > x_max)
+
+            a, b, c = coefficients[i]
+            y_pred[mask] = a * x_new[mask] ** 2 + b * x_new[mask] + c
+
+        return y_pred
+
+    # 计算残差标准差
+    y_pred = predict(x)
+    std = np.std(y - y_pred)
+
+    return {
+        'knots': knots,
+        'coefficients': coefficients,
+        'std': std,
+        'predict': predict,
+        'n_segments': n_segments,
+    }
+
+
 def _parse_plot_weight_expr(expr: str, available_weights: list[float]) -> list[float]:
     """
     支持：
@@ -167,9 +329,9 @@ def _parse_compare_modes(expr: str) -> tuple[str, str]:
     raw = (expr or "").strip().lower().replace(" ", "")
     parts = [p for p in raw.split(",") if p]
     if len(parts) != 2:
-        raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,signal_corrected'：当前={expr!r}")
+        raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,piecewise_quadratic'：当前={expr!r}")
 
-    valid = {"raw", "norm20", "compensated", "signal_corrected"}
+    valid = {"raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic"}
     a, b = parts[0], parts[1]
     if a not in valid or b not in valid:
         raise ValueError(f"--compare-modes 只支持 {sorted(valid)}：当前={expr!r}")
@@ -222,6 +384,8 @@ def _prepare_error_dataframe(
     calibration_df: pd.DataFrame | None = None,
     beta: float = -0.00017,
     gamma: float = -0.006,
+    n_segments: int = 3,
+    piecewise_model_path: str | None = None,
 ) -> pd.DataFrame:
     df = df.copy()
 
@@ -244,6 +408,37 @@ def _prepare_error_dataframe(
             s_corrected = s0 + (s - s0 - gamma * dT) / (1 + beta * dT)
             # 用修正后的信号计算 W20
             df["measured"] = (s_corrected - s0) * 100.0 / (s100 - s0)
+        elif error_mode == "piecewise_quadratic":
+            # 分段二次非线性补偿
+            dT = (df["芯片温度"].to_numpy(float) - df["T20"].to_numpy(float)).astype(float)
+
+            if piecewise_model_path is not None:
+                # 加载预训练模型进行补偿
+                from weight_compensation import PiecewiseQuadraticModel
+
+                model = PiecewiseQuadraticModel.load_json(piecewise_model_path)
+                signal_corrected = model.compensate_signal(s, dT)
+            else:
+                # 对每个重量级别分别拟合和补偿（on-the-fly）
+                signal_corrected = np.zeros_like(s)
+                for w in df["重量"].unique():
+                    mask = df["重量"] == w
+                    dT_w = dT[mask]
+                    s_w = s[mask]
+
+                    # 分段二次拟合: signal = f(dT)
+                    result = fit_piecewise_quadratic(dT_w, s_w, n_segments=n_segments)
+
+                    # 修正公式: S_corrected = S_raw - drift
+                    # drift = predict(dT) - predict(0)
+                    s_at_zero = result['predict'](np.array([0.0]))[0]
+                    s_predicted = result['predict'](dT_w)
+                    drift = s_predicted - s_at_zero
+
+                    signal_corrected[mask] = s_w - drift
+
+            # 用修正后的信号计算 W20
+            df["measured"] = (signal_corrected - s0) * 100.0 / (s100 - s0)
         elif error_mode == "compensated":
             import json
             from pathlib import Path
@@ -362,6 +557,8 @@ def _plot_temp_drift(
     compare_modes: tuple[str, str] | None,
     beta: float = -0.00017,
     gamma: float = -0.006,
+    n_segments: int = 3,
+    piecewise_model_path: str | None = None,
 ) -> None:
     from pathlib import Path
 
@@ -376,7 +573,7 @@ def _plot_temp_drift(
     out_path.mkdir(parents=True, exist_ok=True)
 
     calibration_df: pd.DataFrame | None = None
-    if compare_modes is not None or error_mode in ("norm20", "compensated", "signal_corrected"):
+    if compare_modes is not None or error_mode in ("norm20", "compensated", "signal_corrected", "piecewise_quadratic"):
         calibration_df = _infer_calibration_at_ref_temp(df, ref_temp=ref_temp)
 
     if compare_modes is not None:
@@ -390,6 +587,8 @@ def _plot_temp_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
         df_b = _prepare_error_dataframe(
             df,
@@ -400,6 +599,8 @@ def _plot_temp_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
     else:
         df_err = _prepare_error_dataframe(
@@ -411,6 +612,8 @@ def _plot_temp_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
 
     ylabel = "误差（测得-真实, g）"
@@ -421,7 +624,7 @@ def _plot_temp_drift(
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic"}[error_mode]
 
     for device_id in sorted(df["样机编号"].unique().tolist()):
         if compare_modes is not None:
@@ -515,6 +718,8 @@ def _plot_all_devices_drift(
     ylim: tuple[float, float] | None = None,
     beta: float = -0.00017,
     gamma: float = -0.006,
+    n_segments: int = 3,
+    piecewise_model_path: str | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """
     将所有设备叠加到同一张图：
@@ -548,6 +753,8 @@ def _plot_all_devices_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
         if "T20" not in df_a.columns:
             df_a = df_a.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -562,6 +769,8 @@ def _plot_all_devices_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
         if "T20" not in df_b.columns:
             df_b = df_b.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -582,6 +791,8 @@ def _plot_all_devices_drift(
             calibration_df=calibration_df,
             beta=beta,
             gamma=gamma,
+            n_segments=n_segments,
+            piecewise_model_path=piecewise_model_path,
         )
         if "T20" not in df_err.columns:
             df_err = df_err.merge(calibration_df[["样机编号", "T20"]], on="样机编号", how="left")
@@ -600,7 +811,7 @@ def _plot_all_devices_drift(
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic"}[error_mode]
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
@@ -773,6 +984,8 @@ def main() -> None:
             compare_modes=compare_modes,
             beta=float(args.beta),
             gamma=float(args.gamma),
+            n_segments=int(args.n_segments),
+            piecewise_model_path=args.piecewise_model,
         )
         print(f"\nDrift plots saved to: {args.out_dir}")
         plotted_any = True
@@ -800,6 +1013,8 @@ def main() -> None:
                     compare_modes=compare_modes,
                     beta=float(args.beta),
                     gamma=float(args.gamma),
+                    n_segments=int(args.n_segments),
+                    piecewise_model_path=args.piecewise_model,
                 )
                 all_xlims.append(xlim_i)
                 all_ylims.append(ylim_i)
@@ -824,6 +1039,8 @@ def main() -> None:
                     ylim=global_ylim,
                     beta=float(args.beta),
                     gamma=float(args.gamma),
+                    n_segments=int(args.n_segments),
+                    piecewise_model_path=args.piecewise_model,
                 )
         else:
             # 单张图或不统一坐标轴：直接绘制
@@ -840,6 +1057,8 @@ def main() -> None:
                     compare_modes=compare_modes,
                     beta=float(args.beta),
                     gamma=float(args.gamma),
+                    n_segments=int(args.n_segments),
+                    piecewise_model_path=args.piecewise_model,
                 )
 
         print(f"\nAll-devices drift plot saved to: {args.out_dir}")
