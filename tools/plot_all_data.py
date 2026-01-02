@@ -12,7 +12,64 @@
 
 import argparse
 import sys
+import warnings
+import logging
 from pathlib import Path
+
+# 忽略所有 UserWarning
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# 在导入 matplotlib 之前设置日志级别
+logging.getLogger('matplotlib').setLevel(logging.ERROR)
+
+# 在导入 matplotlib 之前全局配置字体
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+
+from matplotlib import font_manager
+
+# 强制重建 matplotlib 字体缓存
+try:
+    font_manager.FontManager.rebuild()
+except Exception:
+    pass
+
+# 禁用字体添加警告
+font_manager.fontManager.addfont = lambda *args, **kwargs: None
+fm = font_manager.FontManager()
+available_fonts = {f.name for f in fm.ttflist}
+
+# 在创建 pyplot 之前设置字体
+candidates = [
+    'PingFang SC',      # macOS
+    'Heiti SC',         # macOS
+    'STHeiti',          # macOS 备选
+    'Songti SC',        # macOS 备选
+    'SimHei',           # Windows
+    'Microsoft YaHei',  # Windows
+    'WenQuanYi Micro Hei',  # Linux
+    'Noto Sans CJK SC', # Linux
+]
+
+font_set = False
+for font_name in candidates:
+    if font_name in available_fonts:
+        matplotlib.rcParams['font.sans-serif'] = [font_name]
+        font_set = True
+        break
+
+if not font_set:
+    # 如果没有找到任何候选字体，使用系统中第一个支持中文的字体
+    for font_name in available_fonts:
+        if any(cn_char in font_name for cn_char in ['SC', 'TC', 'CJK', '华', '宋', '仿', '黑']):
+            matplotlib.rcParams['font.sans-serif'] = [font_name]
+            font_set = True
+            break
+
+if not font_set:
+    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -22,6 +79,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from data_loader import read_measurement_table
+from tools.piecewise_linear_model import PiecewiseLinearModel
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,7 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-segments",
         type=int,
         default=3,
-        help="分段数量 (默认 3，用于 --quadratic-bands)",
+        help="分段数量 (默认 3，用于 --quadratic-bands 或 --piecewise-correct)",
+    )
+    p.add_argument(
+        "--piecewise-correct",
+        action="store_true",
+        help="使用分段线性模型进行温度补偿: Weight = a·S + b·dT + c·S·dT + d",
     )
     return p
 
@@ -491,9 +554,7 @@ def main():
     x_label = x_label_map[args.x_axis]
     y_label = y_label_map[args.y_axis]
 
-    # 设置中文字体
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
+    # 字体已在模块导入时全局配置，无需重复设置
 
     # ==================== 分面子图模式 ====================
     if args.facet_by_device:
@@ -576,8 +637,56 @@ def main():
             weights = sorted(set(w_true))
             colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
 
-            # 根据是否启用分段二次补偿，选择不同的修正方式
-            if args.quadratic_bands:
+            # 计算修正后的 w20 和误差所需的标定信息
+            s0_arr = np.array([calibrations[int(d)]["s0"] for d in device])
+            s100_arr = np.array([calibrations[int(d)]["s100"] for d in device])
+
+            # 根据是否启用分段线性/二次补偿，选择不同的修正方式
+            if args.piecewise_correct:
+                # ========== 分段线性补偿 ==========
+                # 使用 PiecewiseLinearModel 进行温度补偿
+                print(f"\n{'=' * 60}")
+                print(f"分段线性补偿 ({args.n_segments} 段)")
+                print(f"模型: Weight = a·S + b·dT + c·S·dT + d")
+                print(f"{'=' * 60}")
+
+                # 训练分段线性模型
+                model = PiecewiseLinearModel(n_segments=args.n_segments, include_interaction=True)
+                model.fit(signal, dT, w_true)
+
+                # 预测重量
+                weight_pred = model.predict(signal, dT)
+
+                # 计算误差
+                error_before = w_true - signal  # 原始信号和真实重量的差异（近似）
+                error_after = w_true - weight_pred
+
+                mae_before = np.mean(np.abs(w_true - signal))  # 粗略对比
+                mae_after = np.mean(np.abs(error_after))
+                rmse_after = np.sqrt(np.mean(error_after ** 2))
+
+                # 打印模型摘要
+                model.print_summary()
+
+                print(f"\n预测效果:")
+                print(f"  MAE:  {mae_after:.4f}g")
+                print(f"  RMSE: {rmse_after:.4f}g")
+                print(f"{'=' * 60}")
+
+                # 绘制预测重量（空心圆）
+                for w, c in zip(weights, colors):
+                    mask = w_true == w
+                    ax.scatter(x_data[mask], weight_pred[mask], facecolors='none',
+                              edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
+
+                # 绘制水平参考线（理想情况下预测值应该等于真实重量）
+                x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
+                for w, c in zip(weights, colors):
+                    ax.axhline(y=w, color=c, linestyle='--', linewidth=1.5, alpha=0.5)
+
+                print(f"分段线性补偿数据已绘制 ({args.n_segments} 段)")
+
+            elif args.quadratic_bands:
                 # ========== 分段二次补偿 ==========
                 # 为每个重量级别计算分段二次拟合，然后用于修正
                 piecewise_fits = {}
@@ -608,7 +717,13 @@ def main():
                     # 计算修正效果
                     rmse_before = np.std(y_pts - result['predict'](x_pts))
                     rmse_after = np.std(signal_corrected_pw[mask] - s_at_zero)
-                    print(f"【{int(w)}g】基准信号(dT=0): {s_at_zero:.2f}, 修正后 RMSE: {rmse_after:.4f}")
+
+                    # 输出详细的拟合系数
+                    print(f"\n【{int(w)}g】基准信号(dT=0): {s_at_zero:.2f}, 修正后 RMSE: {rmse_after:.4f}")
+                    print(f"  分段点: {', '.join([f'{k:.1f}' for k in result['knots']])}")
+                    for i, (a, b, c_coef) in enumerate(result['coefficients']):
+                        x_min, x_max = result['knots'][i], result['knots'][i + 1]
+                        print(f"  段{i+1} [{x_min:.0f}, {x_max:.0f}]: S = {a:.4e}×dT² + {b:.6f}×dT + {c_coef:.4f}")
 
                 print(f"{'=' * 60}")
 
@@ -645,6 +760,25 @@ def main():
 
             else:
                 # ========== 原有 β/γ 补偿 ==========
+                # 计算修正后的 w20 和误差
+                w20_corrected = (signal_corrected - s0_arr) * 100.0 / (s100_arr - s0_arr)
+                error_corrected = w20_corrected - w_true
+
+                # 计算修正前后的 MAE 和 RMSE
+                mae_before = np.mean(np.abs(error))
+                rmse_before = np.sqrt(np.mean(error ** 2))
+                mae_after = np.mean(np.abs(error_corrected))
+                rmse_after = np.sqrt(np.mean(error_corrected ** 2))
+
+                # 打印修正前后的对比
+                print(f"\n{'=' * 60}")
+                print(f"β/γ 温度补偿 (β={args.beta}, γ={args.gamma})")
+                print(f"{'=' * 60}")
+                print(f"修正前: MAE = {mae_before:.4f} g, RMSE = {rmse_before:.4f} g")
+                print(f"修正后: MAE = {mae_after:.4f} g, RMSE = {rmse_after:.4f} g")
+                print(f"改善率: MAE {(1-mae_after/mae_before)*100:.1f}%, RMSE {(1-rmse_after/rmse_before)*100:.1f}%")
+                print(f"{'=' * 60}")
+
                 for w, c in zip(weights, colors):
                     mask = w_true == w
                     # 用空心圆绘制修正后的数据

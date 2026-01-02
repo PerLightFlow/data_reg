@@ -2,9 +2,66 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import warnings
+import logging
+
+# 忽略所有 UserWarning
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# 在导入 matplotlib 之前设置日志级别
+logging.getLogger('matplotlib').setLevel(logging.ERROR)
 
 import numpy as np
 import pandas as pd
+
+# 在导入 matplotlib 之前全局配置字体
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+
+from matplotlib import font_manager
+
+# 强制重建 matplotlib 字体缓存
+try:
+    font_manager.FontManager.rebuild()
+except Exception:
+    pass
+
+# 禁用字体添加警告
+font_manager.fontManager.addfont = lambda *args, **kwargs: None
+fm = font_manager.FontManager()
+available_fonts = {f.name for f in fm.ttflist}
+
+# 在创建 pyplot 之前设置字体
+candidates = [
+    'PingFang SC',      # macOS
+    'Heiti SC',         # macOS
+    'STHeiti',          # macOS 备选
+    'Songti SC',        # macOS 备选
+    'SimHei',           # Windows
+    'Microsoft YaHei',  # Windows
+    'WenQuanYi Micro Hei',  # Linux
+    'Noto Sans CJK SC', # Linux
+]
+
+font_set = False
+for font_name in candidates:
+    if font_name in available_fonts:
+        matplotlib.rcParams['font.sans-serif'] = [font_name]
+        font_set = True
+        break
+
+if not font_set:
+    # 如果没有找到任何候选字体，使用系统中第一个支持中文的字体
+    for font_name in available_fonts:
+        if any(cn_char in font_name for cn_char in ['SC', 'TC', 'CJK', '华', '宋', '仿', '黑']):
+            matplotlib.rcParams['font.sans-serif'] = [font_name]
+            font_set = True
+            break
+
+if not font_set:
+    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -492,39 +549,10 @@ def _prepare_error_dataframe(
 
 def _set_matplotlib_chinese_font(plt):
     """
-    尝试设置一个当前系统可用的中文字体，避免出现 `findfont` / `Glyph missing`。
+    字体已在模块导入时全局配置，此函数仅为向后兼容保留。
     """
-
-    from matplotlib import font_manager
-
-    candidates = [
-        # Windows
-        "SimHei",
-        "Microsoft YaHei",
-        # macOS
-        "PingFang SC",
-        "Heiti SC",
-        # Linux
-        "WenQuanYi Micro Hei",
-        "Noto Sans CJK SC",
-        "Noto Serif CJK SC",
-        "AR PL UMing CN",
-        "AR PL UKai CN",
-    ]
-
-    for font_name in candidates:
-        try:
-            font_manager.findfont(
-                font_manager.FontProperties(family=font_name),
-                fallback_to_default=False,
-                rebuild_if_missing=False,
-            )
-        except Exception:
-            continue
-        plt.rcParams["font.sans-serif"] = [font_name]
-        break
-
-    plt.rcParams["axes.unicode_minus"] = False
+    # 全局字体配置已在模块顶部完成，无需在此重复
+    pass
 
 
 def _extract_sorted_xy(df: pd.DataFrame, *, x_col: str, y_col: str) -> tuple[np.ndarray, np.ndarray]:
