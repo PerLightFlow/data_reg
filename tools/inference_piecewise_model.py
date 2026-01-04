@@ -23,44 +23,6 @@ from data_loader import read_measurement_table
 from tools.piecewise_linear_model import PiecewiseLinearModel
 
 
-def infer_calibration(df: pd.DataFrame, device_id: int, ref_temp: float = 20.0) -> dict:
-    """
-    推断设备校准参数
-
-    参数:
-        df: 数据框
-        device_id: 设备编号
-        ref_temp: 参考温度 (默认 20°C)
-
-    返回:
-        dict: {"t20": 基准芯片温度, "s0": 零点信号, "s100": 100g信号}
-    """
-    g = df[df["样机编号"] == device_id]
-    g_ref = g[g["实际温度"] == ref_temp]
-
-    if g_ref.empty:
-        unique_temps = g["实际温度"].unique()
-        closest_temp = min(unique_temps, key=lambda x: abs(x - ref_temp))
-        g_ref = g[g["实际温度"] == closest_temp]
-
-    t20 = float(np.median(g_ref["芯片温度"].to_numpy(float)))
-
-    row_100 = g_ref[g_ref["重量"] == 100]
-    if row_100.empty:
-        row_100 = g[g["重量"] == 100]
-    s100 = float(row_100["信号"].to_numpy(float)[0]) if not row_100.empty else 100.0
-
-    row_0 = g_ref[g_ref["重量"] == 0]
-    if not row_0.empty:
-        s0 = float(row_0["信号"].to_numpy(float)[0])
-    else:
-        A = np.column_stack([g_ref["重量"].to_numpy(float), np.ones(len(g_ref))])
-        y = g_ref["信号"].to_numpy(float)
-        _, s0 = np.linalg.lstsq(A, y, rcond=None)[0]
-
-    return {"t20": t20, "s0": s0, "s100": s100}
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="分段线性补偿模型推理")
     p.add_argument(
@@ -119,7 +81,17 @@ def main():
     print(f"加载模型: {model_path}")
     model = PiecewiseLinearModel.load(model_path)
     print(f"  分段数: {model.n_segments}")
+    print(f"  阶数: {model.order}")
     print(f"  交互项: {'是' if model.include_interaction else '否'}")
+
+    # 从模型获取设备校准参数
+    if model.calibrations is None:
+        print(f"\n错误: 模型文件中没有设备校准参数 (calibrations)")
+        print("请使用新版本的 train_piecewise_model.py 重新训练模型")
+        sys.exit(1)
+
+    calibrations = model.calibrations
+    print(f"  已加载 {len(calibrations)} 台设备的校准参数")
 
     # 加载数据
     print(f"\n加载数据: {args.csv}")
@@ -127,11 +99,17 @@ def main():
     print(f"  数据量: {len(df)} 条")
     print(f"  设备数: {df['样机编号'].nunique()}")
 
-    # 计算每个设备的校准参数
+    # 检查数据中的设备是否都在模型中，过滤掉未知设备
     device_ids = sorted(df["样机编号"].unique())
-    calibrations = {}
-    for device_id in device_ids:
-        calibrations[int(device_id)] = infer_calibration(df, device_id, args.ref_temp)
+    unknown_devices = [int(d) for d in device_ids if int(d) not in calibrations]
+    if unknown_devices:
+        print(f"\n警告: 数据中包含模型未知的设备: {unknown_devices}，将跳过这些设备的数据")
+        print(f"模型已知的设备: {sorted(calibrations.keys())}")
+        # 过滤掉未知设备的数据
+        df = df[~df["样机编号"].isin(unknown_devices)].reset_index(drop=True)
+        print(f"过滤后数据量: {len(df)} 条")
+        # 更新设备列表
+        device_ids = sorted(df["样机编号"].unique())
 
     # 提取数据
     S_raw = df["信号"].to_numpy(float)

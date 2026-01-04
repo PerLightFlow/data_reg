@@ -102,14 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--error-mode",
-        choices=["raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic"],
+        choices=["raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic", "signal"],
         default="norm20",
         help=(
             "误差计算方式：raw=信号-真实重量；"
             "norm20=按20°C(S0,S100)归一后的读数-真实重量；"
             "compensated=归一+温度补偿后的读数-真实重量；"
             "signal_corrected=信号修正后归一化的读数-真实重量；"
-            "piecewise_quadratic=分段二次非线性补偿后的读数-真实重量"
+            "piecewise_quadratic=分段二次非线性补偿后的读数-真实重量；"
+            "signal=只显示原始信号值（不计算误差）"
         ),
     )
     p.add_argument(
@@ -388,7 +389,7 @@ def _parse_compare_modes(expr: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise ValueError(f"--compare-modes 需要两个模式，用逗号分隔，例如 'norm20,piecewise_quadratic'：当前={expr!r}")
 
-    valid = {"raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic"}
+    valid = {"raw", "norm20", "compensated", "signal_corrected", "piecewise_quadratic", "signal"}
     a, b = parts[0], parts[1]
     if a not in valid or b not in valid:
         raise ValueError(f"--compare-modes 只支持 {sorted(valid)}：当前={expr!r}")
@@ -445,6 +446,13 @@ def _prepare_error_dataframe(
     piecewise_model_path: str | None = None,
 ) -> pd.DataFrame:
     df = df.copy()
+
+    # signal 模式：直接显示原始信号值，不计算误差
+    if error_mode == "signal":
+        df["measured"] = df["信号"].astype(float)
+        df["error"] = df["measured"]  # 直接使用信号值作为 y 轴
+        df["error_plot"] = df["error"]
+        return df
 
     if error_mode == "raw":
         df["measured"] = df["信号"].astype(float)
@@ -644,15 +652,18 @@ def _plot_temp_drift(
             piecewise_model_path=piecewise_model_path,
         )
 
-    ylabel = "误差（测得-真实, g）"
-    if relative_to_ref:
+    if error_mode == "signal":
+        ylabel = "原始信号值"
+    elif relative_to_ref:
         ylabel = f"温漂（相对{ref_temp:g}°C归零, g）"
+    else:
+        ylabel = "误差（测得-真实, g）"
 
     if compare_modes is not None:
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic", "signal": "signal"}[error_mode]
 
     for device_id in sorted(df["样机编号"].unique().tolist()):
         if compare_modes is not None:
@@ -831,15 +842,18 @@ def _plot_all_devices_drift(
             available = sorted(df_err["重量"].unique().tolist())
             raise ValueError(f"未找到重量={plot_weight:g}g 的数据，可选重量: {available}")
 
-    ylabel = "误差（测得-真实, g）"
-    if relative_to_ref:
+    if error_mode == "signal":
+        ylabel = "原始信号值"
+    elif relative_to_ref:
         ylabel = f"温漂（相对{ref_temp:g}°C归零, g）"
+    else:
+        ylabel = "误差（测得-真实, g）"
 
     if compare_modes is not None:
         mode_a, mode_b = compare_modes
         mode_desc = f"{mode_a}_vs_{mode_b}"
     else:
-        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic"}[error_mode]
+        mode_desc = {"raw": "raw", "norm20": "norm20", "compensated": "compensated", "signal_corrected": "signal_corrected", "piecewise_quadratic": "piecewise_quadratic", "signal": "signal"}[error_mode]
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)

@@ -81,6 +81,22 @@ import matplotlib.pyplot as plt
 from data_loader import read_measurement_table
 from tools.piecewise_linear_model import PiecewiseLinearModel
 
+# 固定的重量-颜色映射 (0g~100g，每10g一个颜色)
+WEIGHT_COLORS = {
+    50:   '#1f77b4',   # 蓝色
+    100:  '#ff7f0e',   # 橙色
+    200:  '#2ca02c',   # 绿色
+    300:  '#d62728',   # 红色
+    400:  '#9467bd',   # 紫色
+
+}
+
+
+def get_weight_color(weight: float) -> str:
+    """获取指定重量的固定颜色，未定义的重量返回默认颜色"""
+    w = int(round(weight))
+    return WEIGHT_COLORS.get(w, '#999999')
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="绘制所有数据点到同一张图表")
@@ -119,9 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--y-axis",
         type=str,
-        choices=["w20", "signal", "error"],
+        choices=["w20", "signal", "error", "error_pct"],
         default="signal",
-        help="Y轴: w20=归一化重量, signal=原始信号, error=误差",
+        help="Y轴: w20=归一化重量, signal=原始信号, error=误差(g), error_pct=误差百分比(%%)",
     )
     p.add_argument(
         "--ref-temp",
@@ -188,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--piecewise-correct",
         action="store_true",
         help="使用分段线性模型进行温度补偿: Weight = a·S + b·dT + c·S·dT + d",
+    )
+    p.add_argument(
+        "--fit-linear",
+        action="store_true",
+        help="对每个设备中的每个克重进行线性拟合，并在图上标注方程",
+    )
+    p.add_argument(
+        "--fit-all",
+        action="store_true",
+        help="对每个设备的所有数据点拟合一条线性方程（不分克重）",
     )
     return p
 
@@ -406,25 +432,34 @@ def infer_calibration(df: pd.DataFrame, device_id: int, ref_temp: float) -> dict
     g = df[df["样机编号"] == device_id]
     g_ref = g[np.isclose(g["实际温度"].to_numpy(float), ref_temp)]
 
+    used_temp = ref_temp
     if g_ref.empty:
-        raise ValueError(f"设备 {device_id} 缺少 {ref_temp}°C 的数据")
+        # 找不到指定参考温度，选择最接近的温度
+        available_temps = g["实际温度"].unique()
+        if len(available_temps) == 0:
+            raise ValueError(f"设备 {device_id} 没有任何温度数据")
+        used_temp = min(available_temps, key=lambda t: abs(t - ref_temp))
+        print(f"警告: 设备 {device_id} 缺少 {ref_temp}°C 数据，使用最接近的 {used_temp}°C")
+        g_ref = g[np.isclose(g["实际温度"].to_numpy(float), used_temp)]
 
     t20 = float(np.median(g_ref["芯片温度"].to_numpy(float)))
 
+    # 用线性拟合获取 s0 和 s100
+    x = g_ref["重量"].to_numpy(float)
+    y = g_ref["信号"].to_numpy(float)
+    A = np.column_stack([x, np.ones(len(x))])
+    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+
+    # s0: 0g时的信号, s100: 100g时的信号
+    s0_fit = intercept
+    s100_fit = slope * 100 + intercept
+
+    # 优先使用实际数据，没有则用拟合值
     row_100 = g_ref[g_ref["重量"] == 100]
-    if row_100.empty:
-        raise ValueError(f"设备 {device_id} 在 {ref_temp}°C 缺少 100g 数据")
-    s100 = float(row_100["信号"].to_numpy(float)[0])
+    s100 = float(row_100["信号"].to_numpy(float)[0]) if not row_100.empty else s100_fit
 
     row_0 = g_ref[g_ref["重量"] == 0]
-    if not row_0.empty:
-        s0 = float(row_0["信号"].to_numpy(float)[0])
-    else:
-        # 线性外推
-        x = g_ref["重量"].to_numpy(float)
-        y = g_ref["信号"].to_numpy(float)
-        A = np.column_stack([x, np.ones(len(x))])
-        _, s0 = np.linalg.lstsq(A, y, rcond=None)[0]
+    s0 = float(row_0["信号"].to_numpy(float)[0]) if not row_0.empty else s0_fit
 
     return {"t20": t20, "s0": s0, "s100": s100}
 
@@ -445,7 +480,7 @@ def plot_single_axis(ax, x_data, y_data, w_true, device, actual_temp,
     if color_by == "weight":
         weights = sorted(set(w_true))
         if weights_colors is None:
-            weights_colors = dict(zip(weights, plt.cm.tab10(np.linspace(0, 1, len(weights)))))
+            weights_colors = {w: get_weight_color(w) for w in weights}
         for w in weights:
             c = weights_colors[w]
             mask = w_true == w
@@ -530,6 +565,9 @@ def main():
     signal = np.array(signal)
     device = np.array(device)
     error = w20 - w_true
+    # 计算误差百分比: (w20 - w_true) / w_true * 100
+    # 注意：需要避免除以零（w_true=0时）
+    error_pct = np.where(w_true != 0, error / w_true * 100, 0)
 
     # 计算修正后的信号 (如果需要)
     s0_arr = np.array([calibrations[int(d)]["s0"] for d in device])
@@ -537,7 +575,7 @@ def main():
 
     # 选择 X/Y 轴数据
     x_data_map = {"dT": dT, "chip_temp": chip_temp, "actual_temp": actual_temp}
-    y_data_map = {"w20": w20, "signal": signal, "error": error}
+    y_data_map = {"w20": w20, "signal": signal, "error": error, "error_pct": error_pct}
     x_label_map = {
         "dT": "dT = T_chip - T20",
         "chip_temp": "芯片温度",
@@ -547,6 +585,7 @@ def main():
         "w20": "w20 (g)",
         "signal": "原始信号",
         "error": "误差 (g)",
+        "error_pct": "误差百分比 (%)",
     }
 
     x_data = x_data_map[args.x_axis]
@@ -563,39 +602,238 @@ def main():
         n_cols = min(5, n_devices)
         n_rows = (n_devices + n_cols - 1) // n_cols
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows),
-                                 sharex=True, sharey=True)
+        # 如果启用 --fit-linear 或 --fit-all，需要额外的空间显示公式
+        if args.fit_linear or args.fit_all:
+            fig_width = 5.5 * n_cols  # 增加每个子图的宽度
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, 3.5 * n_rows),
+                                     sharex=True, sharey=True)
+        else:
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows),
+                                     sharex=True, sharey=True)
         axes = np.array(axes).flatten()
 
-        # 统一颜色映射
+        # 使用固定颜色映射
         weights = sorted(set(w_true))
-        weights_colors = dict(zip(weights, plt.cm.tab10(np.linspace(0, 1, len(weights)))))
+        weights_colors = {w: get_weight_color(w) for w in weights}
+
+        # 根据 x_axis 类型选择公式中的变量名
+        x_var_map = {"chip_temp": "T", "dT": "dT", "actual_temp": "t"}
+        x_var = x_var_map.get(args.x_axis, "x")
+
+        # 存储所有设备的拟合结果
+        all_fit_results = {}
 
         # 绘制每个设备的子图
         for i, dev_id in enumerate(device_ids):
             ax = axes[i]
+            dev_id_int = int(dev_id)
+
+            # 过滤当前设备的数据
+            dev_mask = device == dev_id_int
+            x_dev = x_data[dev_mask]
+            y_dev = y_data[dev_mask]
+            w_dev = w_true[dev_mask]
+
             plot_single_axis(
                 ax, x_data, y_data, w_true, device, actual_temp,
                 color_by="weight",  # 分面模式下固定按重量着色
                 weights_colors=weights_colors,
                 show_legend=(i == 0),  # 只在第一个子图显示图例
-                title=f"设备 {int(dev_id)}",
-                device_filter=int(dev_id)
+                title=f"设备 {dev_id_int}",
+                device_filter=dev_id_int
             )
+
+            # 如果启用 --fit-linear，对每个克重进行线性拟合
+            if args.fit_linear:
+                fit_results = {}
+                formula_text = ""
+
+                for w in weights:
+                    w_mask = w_dev == w
+                    if w_mask.sum() < 2:  # 至少需要2个点才能拟合
+                        continue
+
+                    x_pts = x_dev[w_mask]
+                    y_pts = y_dev[w_mask]
+
+                    # 线性拟合: y = slope * x + intercept
+                    A = np.column_stack([x_pts, np.ones(len(x_pts))])
+                    coef, _, _, _ = np.linalg.lstsq(A, y_pts, rcond=None)
+                    slope, intercept = coef
+
+                    # 计算 R²
+                    y_pred = slope * x_pts + intercept
+                    ss_res = np.sum((y_pts - y_pred) ** 2)
+                    ss_tot = np.sum((y_pts - np.mean(y_pts)) ** 2)
+                    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+                    fit_results[w] = {
+                        'slope': slope,
+                        'intercept': intercept,
+                        'r_squared': r_squared,
+                    }
+
+                    # 绘制拟合直线
+                    c = weights_colors[w]
+                    x_range = np.linspace(x_pts.min() - 50, x_pts.max() + 50, 100)
+                    y_fit = slope * x_range + intercept
+                    ax.plot(x_range, y_fit, color=c, linestyle='-', linewidth=1.5, alpha=0.8)
+
+                    # 构建公式文本
+                    sign = '+' if intercept >= 0 else ''
+                    formula_text += f"{int(w)}g: y={slope:.4f}{x_var}{sign}{intercept:.1f}\n"
+
+                all_fit_results[dev_id_int] = fit_results
+
+                # 在子图右侧标注公式
+                if formula_text:
+                    ax.text(1.02, 0.98, formula_text.strip(), transform=ax.transAxes, fontsize=7,
+                            verticalalignment='top', fontfamily='monospace',
+                            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.85, pad=0.3))
+
+            # 如果启用 --fit-all，对该设备的所有数据点拟合一条线性方程
+            if args.fit_all:
+                if len(x_dev) >= 2:
+                    # 线性拟合: y = slope * x + intercept
+                    A = np.column_stack([x_dev, np.ones(len(x_dev))])
+                    coef, _, _, _ = np.linalg.lstsq(A, y_dev, rcond=None)
+                    slope, intercept = coef
+
+                    # 计算 R²
+                    y_pred = slope * x_dev + intercept
+                    ss_res = np.sum((y_dev - y_pred) ** 2)
+                    ss_tot = np.sum((y_dev - np.mean(y_dev)) ** 2)
+                    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+                    # 计算修正后的数据
+                    y_corrected = y_dev - y_pred  # 修正后误差 = 原始误差 - 拟合误差
+
+                    all_fit_results[dev_id_int] = {
+                        'slope': slope,
+                        'intercept': intercept,
+                        'r_squared': r_squared,
+                        'mae_before': np.mean(np.abs(y_dev)),
+                        'mae_after': np.mean(np.abs(y_corrected)),
+                        'max_error_after': np.max(np.abs(y_corrected)),
+                        'rmse_before': np.sqrt(np.mean(y_dev ** 2)),
+                        'rmse_after': np.sqrt(np.mean(y_corrected ** 2)),
+                    }
+
+                    # 绘制拟合直线（黑色粗线）
+                    x_range = np.linspace(x_dev.min() - 100, x_dev.max() + 100, 100)
+                    y_fit_line = slope * x_range + intercept
+                    ax.plot(x_range, y_fit_line, color='black', linestyle='-', linewidth=2, alpha=0.9)
+
+                    # 如果启用 --show-corrected，绘制修正后的数据点（空心圆）
+                    if args.show_corrected:
+                        # 绘制 y=0 参考线
+                        ax.axhline(y=0, color='gray', linestyle='--', linewidth=1.5, alpha=0.7)
+
+                        # 按克重绘制空心圆
+                        for w in weights:
+                            w_mask = w_dev == w
+                            if w_mask.sum() > 0:
+                                c = weights_colors[w]
+                                ax.scatter(x_dev[w_mask], y_corrected[w_mask],
+                                          facecolors='none', edgecolors=c,
+                                          s=50, linewidth=1.5, alpha=0.7, marker='o')
+
+                    # 构建公式文本 (使用英文避免乱码)
+                    sign = '+' if intercept >= 0 else ''
+                    formula_text = f"Fit: y={slope:.4f}{x_var}{sign}{intercept:.2f}\nR2 = {r_squared:.4f}"
+                    if args.show_corrected:
+                        formula_text += f"\n\nMAE: {all_fit_results[dev_id_int]['mae_before']:.2f}->{all_fit_results[dev_id_int]['mae_after']:.2f}%"
+                        formula_text += f"\nMax: {all_fit_results[dev_id_int]['max_error_after']:.2f}%"
+
+                    # 在子图右侧标注公式
+                    ax.text(1.02, 0.98, formula_text, transform=ax.transAxes, fontsize=8,
+                            verticalalignment='top', fontfamily='monospace',
+                            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.85, pad=0.3))
 
         # 隐藏多余的子图
         for i in range(n_devices, len(axes)):
             axes[i].set_visible(False)
+
+        # 固定坐标轴范围和刻度
+        for ax in axes[:n_devices]:
+            ax.set_xlim(-1000, 6000)
+            ax.set_xticks(np.arange(-1000, 6001, 500))
+            # 根据 y_axis 类型设置 Y 轴范围
+            if args.y_axis == "error_pct":
+                y_min, y_max = y_data.min(), y_data.max()
+                y_margin = (y_max - y_min) * 0.1
+                ax.set_ylim(y_min - y_margin, y_max + y_margin)
+            elif args.y_axis == "error":
+                y_min, y_max = y_data.min(), y_data.max()
+                y_margin = (y_max - y_min) * 0.1
+                ax.set_ylim(y_min - y_margin, y_max + y_margin)
+            else:
+                ax.set_ylim(0, 500)
+                ax.set_yticks(np.arange(0, 501, 50))
 
         # 添加共享的坐标轴标签
         fig.text(0.5, 0.02, x_label, ha='center', fontsize=12)
         fig.text(0.02, 0.5, y_label, va='center', rotation='vertical', fontsize=12)
 
         # 添加总标题
-        fig.suptitle(f"分设备数据分布 (共 {len(df)} 个数据点, {n_devices} 台设备)",
+        if args.fit_linear:
+            title_suffix = " [按克重线性拟合]"
+        elif args.fit_all:
+            title_suffix = " [全数据线性拟合]"
+        else:
+            title_suffix = ""
+        fig.suptitle(f"分设备数据分布 (共 {len(df)} 个数据点, {n_devices} 台设备){title_suffix}",
                     fontsize=14, y=0.98)
 
-        plt.tight_layout(rect=[0.03, 0.03, 1, 0.96])
+        # 如果启用按克重线性拟合，打印所有结果到控制台
+        if args.fit_linear and all_fit_results:
+            print(f"\n{'=' * 70}")
+            print(f"线性拟合结果 (y = slope × {x_var} + intercept)")
+            print(f"{'=' * 70}")
+            for dev_id_int in sorted(all_fit_results.keys()):
+                print(f"\n【设备 {dev_id_int}】")
+                for w in sorted(all_fit_results[dev_id_int].keys()):
+                    fit = all_fit_results[dev_id_int][w]
+                    sign = '+' if fit['intercept'] >= 0 else ''
+                    print(f"  {int(w):3d}g: y = {fit['slope']:.6f} × {x_var} {sign} {fit['intercept']:.4f}  (R² = {fit['r_squared']:.4f})")
+            print(f"{'=' * 70}")
+
+        # 如果启用全数据线性拟合，打印所有结果到控制台
+        if args.fit_all and all_fit_results:
+            print(f"\n{'=' * 70}")
+            print(f"全数据线性拟合结果 (y = slope × {x_var} + intercept)")
+            print(f"{'=' * 70}")
+            for dev_id_int in sorted(all_fit_results.keys()):
+                fit = all_fit_results[dev_id_int]
+                sign = '+' if fit['intercept'] >= 0 else ''
+                print(f"设备 {dev_id_int}: y = {fit['slope']:.6f} × {x_var} {sign} {fit['intercept']:.4f}  (R² = {fit['r_squared']:.4f})")
+
+            # 如果启用修正，打印修正效果统计
+            if args.show_corrected:
+                print(f"\n{'-' * 70}")
+                print(f"修正效果统计 (MAE: 平均绝对误差, Max: 最大误差)")
+                print(f"{'-' * 70}")
+                total_mae_before = 0
+                total_mae_after = 0
+                total_max_after = 0
+                for dev_id_int in sorted(all_fit_results.keys()):
+                    fit = all_fit_results[dev_id_int]
+                    improvement = (1 - fit['mae_after'] / fit['mae_before']) * 100 if fit['mae_before'] > 0 else 0
+                    print(f"设备 {dev_id_int}: MAE {fit['mae_before']:.2f}% → {fit['mae_after']:.2f}%  Max: {fit['max_error_after']:.2f}%  (改善 {improvement:.1f}%)")
+                    total_mae_before += fit['mae_before']
+                    total_mae_after += fit['mae_after']
+                    total_max_after = max(total_max_after, fit['max_error_after'])
+                avg_mae_before = total_mae_before / len(all_fit_results)
+                avg_mae_after = total_mae_after / len(all_fit_results)
+                avg_improvement = (1 - avg_mae_after / avg_mae_before) * 100 if avg_mae_before > 0 else 0
+                print(f"{'-' * 70}")
+                print(f"平均: MAE {avg_mae_before:.2f}% → {avg_mae_after:.2f}%  全局Max: {total_max_after:.2f}%  (改善 {avg_improvement:.1f}%)")
+            print(f"{'=' * 70}")
+
+        if args.fit_linear or args.fit_all:
+            plt.tight_layout(rect=[0.03, 0.03, 0.88, 0.96])  # 右侧留空间给公式
+        else:
+            plt.tight_layout(rect=[0.03, 0.03, 1, 0.96])
 
     # ==================== 普通单图模式 ====================
     else:
@@ -604,8 +842,8 @@ def main():
         # 根据着色方式绘制
         if args.color_by == "weight":
             weights = sorted(set(w_true))
-            colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
-            for w, c in zip(weights, colors):
+            for w in weights:
+                c = get_weight_color(w)
                 mask = w_true == w
                 n = mask.sum()
                 ax.scatter(x_data[mask], y_data[mask], c=[c],
@@ -635,7 +873,6 @@ def main():
         # 绘制修正后的数据 (如果启用)
         if args.show_corrected and args.y_axis == "signal" and args.color_by == "weight":
             weights = sorted(set(w_true))
-            colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
 
             # 计算修正后的 w20 和误差所需的标定信息
             s0_arr = np.array([calibrations[int(d)]["s0"] for d in device])
@@ -674,14 +911,16 @@ def main():
                 print(f"{'=' * 60}")
 
                 # 绘制预测重量（空心圆）
-                for w, c in zip(weights, colors):
+                for w in weights:
+                    c = get_weight_color(w)
                     mask = w_true == w
                     ax.scatter(x_data[mask], weight_pred[mask], facecolors='none',
                               edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
 
                 # 绘制水平参考线（理想情况下预测值应该等于真实重量）
                 x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
-                for w, c in zip(weights, colors):
+                for w in weights:
+                    c = get_weight_color(w)
                     ax.axhline(y=w, color=c, linestyle='--', linewidth=1.5, alpha=0.5)
 
                 print(f"分段线性补偿数据已绘制 ({args.n_segments} 段)")
@@ -728,7 +967,8 @@ def main():
                 print(f"{'=' * 60}")
 
                 # 绘制修正后的数据（空心圆）
-                for w, c in zip(weights, colors):
+                for w in weights:
+                    c = get_weight_color(w)
                     mask = w_true == w
                     ax.scatter(x_data[mask], signal_corrected_pw[mask], facecolors='none',
                               edgecolors=c, s=60, linewidth=1.5, alpha=0.6, marker='o')
@@ -737,7 +977,8 @@ def main():
                 if args.show_bands or args.quadratic_bands:
                     x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
 
-                    for w, c in zip(weights, colors):
+                    for w in weights:
+                        c = get_weight_color(w)
                         mask = w_true == w
                         y_corrected = signal_corrected_pw[mask]
 
@@ -779,7 +1020,8 @@ def main():
                 print(f"改善率: MAE {(1-mae_after/mae_before)*100:.1f}%, RMSE {(1-rmse_after/rmse_before)*100:.1f}%")
                 print(f"{'=' * 60}")
 
-                for w, c in zip(weights, colors):
+                for w in weights:
+                    c = get_weight_color(w)
                     mask = w_true == w
                     # 用空心圆绘制修正后的数据
                     ax.scatter(x_data[mask], signal_corrected[mask], facecolors='none',
@@ -790,7 +1032,8 @@ def main():
                     # 为修正后的数据计算新的区间带
                     x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
 
-                    for w, c in zip(weights, colors):
+                    for w in weights:
+                        c = get_weight_color(w)
                         mask = w_true == w
                         x_pts = x_data[mask]
                         y_pts = signal_corrected[mask]
@@ -844,7 +1087,6 @@ def main():
             # 绘制区间带
             x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 200)
             weights = sorted(set(w_true))
-            colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
 
             # 收集公式信息用于显示
             formula_lines = []
@@ -852,7 +1094,8 @@ def main():
             x_var_map = {"chip_temp": "T", "dT": "dT", "actual_temp": "t"}
             x_var = x_var_map.get(args.x_axis, "x")
 
-            for w, c in zip(weights, colors):
+            for w in weights:
+                c = get_weight_color(w)
                 band = bands[w]
                 slope = band['slope']
                 intercept = band['intercept']
@@ -918,7 +1161,6 @@ def main():
         if args.quadratic_bands and args.color_by == "weight" and not args.show_corrected:
             x_range = np.linspace(x_data.min() - 100, x_data.max() + 100, 500)
             weights = sorted(set(w_true))
-            colors = plt.cm.tab10(np.linspace(0, 1, len(weights)))
 
             # 根据 x_axis 类型选择公式中的变量名
             x_var_map = {"chip_temp": "T", "dT": "dT", "actual_temp": "t"}
@@ -931,7 +1173,8 @@ def main():
             print(f"分段二次非线性拟合 ({args.n_segments} 段, 连续约束)")
             print(f"{'=' * 60}")
 
-            for w, c in zip(weights, colors):
+            for w in weights:
+                c = get_weight_color(w)
                 mask = w_true == w
                 x_pts = x_data[mask]
                 y_pts = y_data[mask]
@@ -990,6 +1233,22 @@ def main():
                         bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.9))
 
             print(f"分段二次区间带已绘制 (±{args.band_sigma}σ)")
+
+        # 固定坐标轴范围和刻度
+        ax.set_xlim(-1000, 6000)
+        ax.set_xticks(np.arange(-1000, 6001, 500))
+        # 根据 y_axis 类型设置 Y 轴范围
+        if args.y_axis == "error_pct":
+            y_min, y_max = y_data.min(), y_data.max()
+            y_margin = (y_max - y_min) * 0.1
+            ax.set_ylim(y_min - y_margin, y_max + y_margin)
+        elif args.y_axis == "error":
+            y_min, y_max = y_data.min(), y_data.max()
+            y_margin = (y_max - y_min) * 0.1
+            ax.set_ylim(y_min - y_margin, y_max + y_margin)
+        else:
+            ax.set_ylim(0, 500)
+            ax.set_yticks(np.arange(0, 501, 50))
 
         ax.set_xlabel(x_label, fontsize=12)
         ax.set_ylabel(y_label, fontsize=12)

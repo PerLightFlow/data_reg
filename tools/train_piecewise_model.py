@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-训练分段线性补偿模型
+训练分段多项式补偿模型
+
+一阶公式: Weight = K*S + d
+二阶公式: Weight = K1*S + K2*S² + d
+
+温度区间按 dT 划分，每 1000 一段 (对应实际温度每 10°C 一段):
+    段0: dT ∈ [-2000, -1000)  对应实际温度约 0-10°C
+    段1: dT ∈ [-1000, 0)      对应实际温度约 10-20°C
+    段2: dT ∈ [0, 1000)       对应实际温度约 20-30°C
+    段3: dT ∈ [1000, 2000)    对应实际温度约 30-40°C
+    段4: dT ∈ [2000, 3000]    对应实际温度约 40-50°C
 
 用法:
-    python tools/train_piecewise_model.py
-    python tools/train_piecewise_model.py --n-segments 4
-    python tools/train_piecewise_model.py --output models/piecewise_model.json
+    python tools/train_piecewise_model.py                          # 一阶模型
+    python tools/train_piecewise_model.py --order 2                # 二阶模型
+    python tools/train_piecewise_model.py --csv data/数据整理_0103.xlsx
+    python tools/train_piecewise_model.py --output models/my_model.json
     python tools/train_piecewise_model.py --cross-validate
 """
 
@@ -20,6 +31,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data_loader import read_measurement_table
 from tools.piecewise_linear_model import PiecewiseLinearModel, cross_validate_by_weight
+
+# 固定的设备芯片基准温度 (T20)
+DEVICE_T20_VALUES = {
+    1: 1714,
+    2: 2345,
+    3: 2267,
+    4: 1980,
+    5: 2034,
+    6: 2334,
+    7: 2278,
+    8: 2034,
+    9: 1721,
+    10: 2210,
+}
 
 
 def infer_calibration(df, device_id: int, ref_temp: float = 20.0):
@@ -43,7 +68,12 @@ def infer_calibration(df, device_id: int, ref_temp: float = 20.0):
         closest_temp = min(unique_temps, key=lambda x: abs(x - ref_temp))
         g_ref = g[g["实际温度"] == closest_temp]
 
-    t20 = float(np.median(g_ref["芯片温度"].to_numpy(float)))
+    # 使用固定的 T20 值
+    if device_id in DEVICE_T20_VALUES:
+        t20 = float(DEVICE_T20_VALUES[device_id])
+    else:
+        # 如果设备不在预设列表中，则从数据计算
+        t20 = float(np.median(g_ref["芯片温度"].to_numpy(float)))
 
     # 提取 100g 信号
     row_100 = g_ref[g_ref["重量"] == 100]
@@ -65,7 +95,7 @@ def infer_calibration(df, device_id: int, ref_temp: float = 20.0):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="训练分段线性补偿模型")
+    p = argparse.ArgumentParser(description="训练分段多项式补偿模型")
     p.add_argument(
         "--csv",
         type=str,
@@ -79,10 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="XLSX 工作表名称或序号",
     )
     p.add_argument(
-        "--n-segments",
+        "--order",
         type=int,
-        default=5,
-        help="分段数量 (默认 5)",
+        default=1,
+        choices=[1, 2],
+        help="多项式阶数: 1=一阶(K*S+d), 2=二阶(K1*S+K2*S²+d) (默认 1)",
     )
     p.add_argument(
         "--ref-temp",
@@ -140,8 +171,16 @@ def main():
     print(f"  Weight 范围: [{Weight.min():.0f}, {Weight.max():.0f}]")
 
     # 训练模型
-    print(f"\n训练分段线性模型 ({args.n_segments} 段)...")
-    model = PiecewiseLinearModel(n_segments=args.n_segments)
+    order_name = "一阶" if args.order == 1 else "二阶"
+    formula = "Weight = K×S + d" if args.order == 1 else "Weight = K1×S + K2×S² + d"
+
+    print(f"\n{'=' * 60}")
+    print(f"训练分段{order_name}补偿模型")
+    print(f"公式: {formula}")
+    print(f"温度区间: 每 1000 dT 一段 (对应实际温度每 10°C)")
+    print(f"{'=' * 60}")
+
+    model = PiecewiseLinearModel(order=args.order)
     model.fit(S_raw, dT, Weight)
 
     # 打印模型摘要
@@ -157,7 +196,13 @@ def main():
 
     # 交叉验证
     if args.cross_validate:
-        cv_results = cross_validate_by_weight(S_raw, dT, Weight, args.n_segments)
+        cross_validate_by_weight(S_raw, dT, Weight, order=args.order)
+
+    # 保存设备校准参数到模型
+    model.set_calibrations(calibrations)
+    print(f"\n设备校准参数 (T20):")
+    for dev_id, cal in sorted(calibrations.items()):
+        print(f"  设备 {dev_id}: T20={cal['t20']:.0f}")
 
     # 保存模型
     output_path = Path(args.output)
@@ -180,27 +225,16 @@ def main():
             w_pred = model.predict_single(s, dt)
 
             seg_idx, coef = model.get_formula_for_dT(dt)
-            print(f"\n输入: S_raw={s:.2f}, dT={dt:.0f}")
-            if len(coef) == 4:
-                a, b, c, d = coef
-                print(f"  使用段 {seg_idx}: W = {a:.6f}×S + ({b:.6f})×dT + ({c:.9f})×S×dT + {d:.4f}")
+            print(f"\n输入: S={s:.2f}, dT={dt:.0f}")
+            if args.order == 1:
+                K, d = coef
+                print(f"  使用段 {seg_idx}: Weight = {K:.6f}×S + ({d:+.4f})")
+                print(f"  计算: {K:.6f}×{s:.2f} + {d:.4f} = {w_pred:.2f}g")
             else:
-                a, b, c = coef
-                print(f"  使用段 {seg_idx}: W = {a:.6f}×S + ({b:.6f})×dT + {c:.4f}")
-            print(f"  预测: {w_pred:.2f}g, 实际: {w_true:.0f}g, 误差: {w_pred - w_true:.2f}g")
-
-        # 模拟实际使用场景
-        print(f"\n{'─' * 60}")
-        print("模拟实际使用 (任意重量预测):")
-        test_cases = [
-            (63.5, 350, "模拟 ~223g"),
-            (85.2, -500, "模拟 ~382g"),
-            (45.0, 100, "模拟 ~150g"),
-        ]
-        for s, dt, desc in test_cases:
-            w_pred = model.predict_single(s, dt)
-            seg_idx, _ = model.get_formula_for_dT(dt)
-            print(f"  {desc}: S_raw={s}, dT={dt} → 预测: {w_pred:.2f}g (段{seg_idx})")
+                K1, K2, d = coef
+                print(f"  使用段 {seg_idx}: Weight = {K1:.6f}×S + {K2:.9f}×S² + ({d:+.4f})")
+                print(f"  计算: {K1:.6f}×{s:.2f} + {K2:.9f}×{s:.2f}² + {d:.4f} = {w_pred:.2f}g")
+            print(f"  实际: {w_true:.0f}g, 误差: {w_pred - w_true:+.2f}g")
 
 
 if __name__ == "__main__":
